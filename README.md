@@ -1,4 +1,4 @@
-# Trustify
+# Trustify test
 
 [![ci](https://github.com/trustification/trustify/actions/workflows/ci.yaml/badge.svg)](https://github.com/trustification/trustify/actions/workflows/ci.yaml)
 
