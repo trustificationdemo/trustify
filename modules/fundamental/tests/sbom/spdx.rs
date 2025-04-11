@@ -1,7 +1,9 @@
 mod aliases;
 mod corner_cases;
 mod external;
+mod issue_1417;
 mod issue_552;
+mod parallel;
 mod perf;
 mod reingest;
 
@@ -69,6 +71,9 @@ async fn parse_spdx_quarkus(ctx: &TrustifyContext) -> Result<(), anyhow::Error> 
 
             assert!(contains.len() > 500);
 
+            assert_eq!(sbom.sbom.authors, vec!["Organization: Red Hat Product Security (secalert@redhat.com)".to_string()]);
+            assert_eq!(sbom.sbom.suppliers, vec!["Organization: Red Hat".to_string()]);
+
             Ok(())
         },
     ).await
@@ -123,7 +128,7 @@ async fn ingest_spdx_broken_refs(ctx: &TrustifyContext) -> Result<(), anyhow::Er
 
     assert_eq!(
         err.to_string(),
-        "Invalid reference: SPDXRef-0068e307-de91-4e82-b407-7a41217f9758"
+        "invalid content: Invalid reference: SPDXRef-0068e307-de91-4e82-b407-7a41217f9758"
     );
 
     let result = sbom
@@ -137,10 +142,9 @@ async fn ingest_spdx_broken_refs(ctx: &TrustifyContext) -> Result<(), anyhow::Er
 }
 
 #[instrument(skip(ctx, f))]
-pub async fn test_with_spdx<F, Fut>(ctx: &TrustifyContext, sbom: &str, f: F) -> anyhow::Result<()>
+pub async fn test_with_spdx<F>(ctx: &TrustifyContext, sbom: &str, f: F) -> anyhow::Result<()>
 where
-    F: FnOnce(WithContext) -> Fut,
-    Fut: Future<Output = anyhow::Result<()>>,
+    F: AsyncFnOnce(WithContext) -> anyhow::Result<()>,
 {
     test_with(
         ctx,
@@ -150,11 +154,9 @@ where
             let (sbom, _) = parse_spdx(&Discard, json)?;
             Ok(fix_spdx_rels(sbom))
         },
-        |ctx, sbom, tx| {
-            Box::pin(async move {
-                ctx.ingest_spdx(sbom.clone(), &Discard, tx).await?;
-                Ok(())
-            })
+        async move |ctx, sbom, tx| {
+            ctx.ingest_spdx(sbom.clone(), &Discard, tx).await?;
+            Ok(())
         },
         |sbom| sbom::spdx::Information(sbom).into(),
         f,

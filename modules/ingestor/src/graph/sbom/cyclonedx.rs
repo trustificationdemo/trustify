@@ -4,22 +4,27 @@ use crate::{
         product::ProductInformation,
         purl::creator::PurlCreator,
         sbom::{
-            CycloneDx as CycloneDxProcessor, LicenseCreator, LicenseInfo, PackageCreator,
-            PackageReference, References, RelationshipCreator, SbomContext, SbomInformation,
+            CycloneDx as CycloneDxProcessor, LicenseCreator, LicenseInfo, NodeInfoParam,
+            PackageCreator, PackageLicensenInfo, PackageReference, References, RelationshipCreator,
+            SbomContext, SbomInformation,
             processor::{
                 InitContext, PostContext, Processor, RedHatProductComponentRelationships,
                 RunProcessors,
             },
+            sbom_package_license::LicenseCategory,
         },
     },
     service::Error,
 };
-use sbom_walker::report::{ReportSink, check};
+use sbom_walker::{
+    model::sbom::serde_cyclonedx::Sbom,
+    report::{ReportSink, check},
+};
 use sea_orm::ConnectionTrait;
 use serde_cyclonedx::cyclonedx::v_1_6::{
-    Component, ComponentEvidenceIdentity, CycloneDx, LicenseChoiceUrl,
+    Component, ComponentEvidenceIdentity, CycloneDx, LicenseChoiceUrl, OrganizationalContact,
 };
-use std::str::FromStr;
+use std::{borrow::Cow, str::FromStr};
 use time::{OffsetDateTime, format_description::well_known::Iso8601};
 use tracing::instrument;
 use trustify_common::{cpe::Cpe, purl::Purl};
@@ -34,6 +39,15 @@ use uuid::Uuid;
 pub const CYCLONEDX_DOC_REF: &str = "CycloneDX-doc-ref";
 
 pub struct Information<'a>(pub &'a CycloneDx);
+
+fn from_contact(contact: &OrganizationalContact) -> Option<String> {
+    match (&contact.name, &contact.email) {
+        (Some(name), Some(email)) => Some(format!("{name} <{email}>")),
+        (Some(name), None) => Some(name.to_string()),
+        (None, Some(email)) => Some(email.to_string()),
+        (None, None) => None,
+    }
+}
 
 impl<'a> From<Information<'a>> for SbomInformation {
     fn from(value: Information<'a>) -> Self {
@@ -53,12 +67,31 @@ impl<'a> From<Information<'a>> for SbomInformation {
             .and_then(|metadata| metadata.authors.as_ref())
             .into_iter()
             .flatten()
-            .filter_map(|author| match (&author.name, &author.email) {
-                (Some(name), Some(email)) => Some(format!("{name} <{email}>")),
-                (Some(name), None) => Some(name.to_string()),
-                (None, Some(email)) => Some(email.to_string()),
-                (None, None) => None,
+            .filter_map(from_contact)
+            .collect();
+
+        // supplier
+
+        let suppliers = sbom
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.supplier.as_ref())
+            .into_iter()
+            .flat_map(|oe| {
+                // try name first
+                oe.name
+                    .clone()
+                    .map(|name| vec![name])
+                    .or_else(|| {
+                        // then contact
+                        oe.contact
+                            .as_ref()
+                            .map(|c| c.iter().filter_map(from_contact).collect())
+                    })
+                    // last URL
+                    .or_else(|| oe.url.clone())
             })
+            .flatten()
             .collect();
 
         let name = sbom
@@ -93,6 +126,7 @@ impl<'a> From<Information<'a>> for SbomInformation {
             name,
             published,
             authors,
+            suppliers,
             data_licenses,
         }
     }
@@ -102,13 +136,13 @@ impl SbomContext {
     #[instrument(skip(connection, sbom, warnings), err(level=tracing::Level::INFO))]
     pub async fn ingest_cyclonedx<C: ConnectionTrait>(
         &self,
-        mut sbom: CycloneDx,
+        mut sbom: Box<CycloneDx>,
         warnings: &dyn ReportSink,
         connection: &C,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), Error> {
         // pre-flight checks
 
-        check::serde_cyclonedx::all(warnings, &(&sbom).into());
+        check::serde_cyclonedx::all(warnings, &Sbom::V1_6(Cow::Borrowed(&sbom)));
 
         let mut creator = Creator::new(self.sbom.sbom_id);
 
@@ -143,7 +177,8 @@ impl SbomContext {
                     .cpe
                     .as_ref()
                     .map(|cpe| Cpe::from_str(cpe.as_ref()))
-                    .transpose()?;
+                    .transpose()
+                    .map_err(|err| Error::InvalidContent(err.into()))?;
                 let pr = self
                     .graph
                     .ingest_product(
@@ -250,7 +285,7 @@ impl<'a> Creator<'a> {
         self,
         db: &impl ConnectionTrait,
         processors: &mut [Box<dyn Processor>],
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), Error> {
         let mut purls = PurlCreator::new();
         let mut cpes = CpeCreator::new();
         let mut packages = PackageCreator::with_capacity(self.sbom_id, self.components.len());
@@ -292,7 +327,9 @@ impl<'a> Creator<'a> {
         let sources = References::new()
             .add_source(&[CYCLONEDX_DOC_REF])
             .add_source(&packages);
-        relationships.validate(sources).map_err(Error::Generic)?;
+        relationships
+            .validate(sources)
+            .map_err(Error::InvalidContent)?;
 
         // create
 
@@ -316,7 +353,6 @@ struct ComponentCreator<'a> {
     relationships: &'a mut RelationshipCreator<CycloneDxProcessor>,
 
     refs: Vec<PackageReference>,
-    license_relations: Vec<LicenseInfo>,
 }
 
 impl<'a> ComponentCreator<'a> {
@@ -332,7 +368,6 @@ impl<'a> ComponentCreator<'a> {
             purls,
             licenses,
             refs: Default::default(),
-            license_relations: Default::default(),
             packages,
             relationships,
         }
@@ -344,7 +379,7 @@ impl<'a> ComponentCreator<'a> {
             .clone()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-        self.add_license(comp);
+        let licenses_uuid = self.add_license(comp);
 
         if let Some(cpe) = &comp.cpe {
             if let Ok(cpe) = Cpe::from_str(cpe.as_ref()) {
@@ -384,12 +419,23 @@ impl<'a> ComponentCreator<'a> {
             }
         }
 
+        let cyclone_licenses = licenses_uuid
+            .iter()
+            .map(|l| PackageLicensenInfo {
+                license_id: *l,
+                license_type: LicenseCategory::Declared,
+            })
+            .collect::<Vec<_>>();
+
         self.packages.add(
-            node_id.clone(),
-            comp.name.to_string(),
-            comp.version.as_ref().map(|v| v.to_string()),
+            NodeInfoParam {
+                node_id: node_id.clone(),
+                name: comp.name.to_string(),
+                group: comp.group.as_ref().map(|v| v.to_string()),
+                version: comp.version.as_ref().map(|v| v.to_string()),
+                package_license_info: cyclone_licenses,
+            },
             self.refs,
-            self.license_relations,
             comp.hashes.clone().into_iter().flatten(),
         );
 
@@ -405,13 +451,13 @@ impl<'a> ComponentCreator<'a> {
 
             // create the component
 
-            let creator = ComponentCreator::new(
+            let creator = Box::new(ComponentCreator::new(
                 self.cpes,
                 self.purls,
                 self.licenses,
                 self.packages,
                 self.relationships,
-            );
+            ));
 
             creator.create(ancestor);
 
@@ -432,13 +478,13 @@ impl<'a> ComponentCreator<'a> {
 
             // create the component
 
-            let creator = ComponentCreator::new(
+            let creator = Box::new(ComponentCreator::new(
                 self.cpes,
                 self.purls,
                 self.licenses,
                 self.packages,
                 self.relationships,
-            );
+            ));
 
             creator.create(variant);
 
@@ -461,7 +507,8 @@ impl<'a> ComponentCreator<'a> {
         self.purls.add(purl);
     }
 
-    fn add_license(&mut self, component: &Component) {
+    fn add_license(&mut self, component: &Component) -> Vec<Uuid> {
+        let mut license_uuid = vec![];
         if let Some(licenses) = &component.licenses {
             match licenses {
                 LicenseChoiceUrl::Variant0(licenses) => {
@@ -477,7 +524,7 @@ impl<'a> ComponentCreator<'a> {
                         let license = LicenseInfo { license };
 
                         self.licenses.add(&license);
-                        self.license_relations.push(license.clone());
+                        license_uuid.push(license.uuid());
                     }
                 }
                 LicenseChoiceUrl::Variant1(licenses) => {
@@ -487,10 +534,11 @@ impl<'a> ComponentCreator<'a> {
                         };
 
                         self.licenses.add(&license);
-                        self.license_relations.push(license.clone());
+                        license_uuid.push(license.uuid());
                     }
                 }
             }
         }
+        license_uuid
     }
 }

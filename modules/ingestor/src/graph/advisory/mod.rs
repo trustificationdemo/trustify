@@ -3,14 +3,13 @@
 use crate::{
     common::{Deprecation, DeprecationExt},
     graph::{
-        Graph, Outcome, advisory::advisory_vulnerability::AdvisoryVulnerabilityContext,
-        error::Error,
+        CreateOutcome, Graph, Outcome,
+        advisory::advisory_vulnerability::AdvisoryVulnerabilityContext, error::Error,
     },
 };
-use hex::ToHex;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, EntityTrait, IntoActiveModel,
-    ModelTrait, QueryFilter, QuerySelect, RelationTrait,
+    ModelTrait, QueryFilter, QuerySelect, RelationTrait, TransactionTrait,
 };
 use sea_query::{Condition, JoinType, OnConflict};
 use semver::Version;
@@ -110,17 +109,20 @@ impl Graph {
     }
 
     #[instrument(skip(self, labels, information, connection), err(level=tracing::Level::INFO))]
-    pub async fn ingest_advisory<C: ConnectionTrait>(
+    pub async fn ingest_advisory<C>(
         &self,
         identifier: impl Into<String> + Debug,
         labels: impl Into<Labels>,
         digests: &Digests,
         information: impl Into<AdvisoryInformation>,
         connection: &C,
-    ) -> Result<Outcome<AdvisoryContext>, Error> {
+    ) -> Result<Outcome<AdvisoryContext>, Error>
+    where
+        C: ConnectionTrait + TransactionTrait,
+    {
         let identifier = identifier.into();
         let labels = labels.into();
-        let sha256 = digests.sha256.encode_hex::<String>();
+
         let AdvisoryInformation {
             id,
             title,
@@ -131,27 +133,21 @@ impl Graph {
             version,
         } = information.into();
 
-        if let Some(found) = self.get_advisory_by_digest(&sha256, connection).await? {
-            // we already have the exact same document.
-            return Ok(Outcome::Existed(found));
-        }
+        let new_id = match self
+            .create_doc(digests, connection, async |sha256| {
+                self.get_advisory_by_digest(&sha256, connection).await
+            })
+            .await?
+        {
+            CreateOutcome::Exists(advisory) => return Ok(Outcome::Existed(advisory)),
+            CreateOutcome::Created(new_id) => new_id,
+        };
 
         let organization = if let Some(issuer) = issuer {
             Some(self.ingest_organization(issuer, (), connection).await?)
         } else {
             None
         };
-
-        let doc_model = source_document::ActiveModel {
-            id: Default::default(),
-            sha256: Set(sha256),
-            sha384: Set(digests.sha384.encode_hex()),
-            sha512: Set(digests.sha512.encode_hex()),
-            size: Set(digests.size as i64),
-            ingested: sea_orm::Set(OffsetDateTime::now_utc()),
-        };
-
-        let doc = doc_model.insert(connection).await?;
 
         // insert
 
@@ -168,7 +164,7 @@ impl Graph {
             modified: Set(modified),
             withdrawn: Set(withdrawn),
             labels: Set(labels),
-            source_document_id: Set(Some(doc.id)),
+            source_document_id: Set(Some(new_id)),
         };
 
         let result = model.insert(connection).await?;

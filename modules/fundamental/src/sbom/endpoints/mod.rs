@@ -6,6 +6,10 @@ mod test;
 
 pub use query::*;
 
+use crate::license::{
+    get_sanitize_filename,
+    service::{LicenseService, license_export::LicenseExporter},
+};
 use crate::{
     Error::{self, Internal},
     purl::service::PurlService,
@@ -64,9 +68,57 @@ pub fn configure(
         .service(upload)
         .service(download)
         .service(label::set)
-        .service(label::update);
+        .service(label::update)
+        .service(get_license_export);
 }
 
+const CONTENT_TYPE_GZIP: &str = "application/gzip";
+
+#[utoipa::path(
+    tag = "sbom",
+    operation_id = "getLicenseExport",
+    params(
+        ("id" = String, Path,),
+    ),
+    responses(
+        (status = 200, description = "license gzip files", body = Vec<u8>, content_type = CONTENT_TYPE_GZIP),
+        (status = 404, description = "The document could not be found"),
+    ),
+)]
+#[get("/v2/sbom/{id}/license-export")]
+pub async fn get_license_export(
+    fetcher: web::Data<LicenseService>,
+    db: web::Data<Database>,
+    id: web::Path<String>,
+) -> actix_web::Result<impl Responder> {
+    let id = Id::from_str(&id).map_err(Error::IdKey)?;
+
+    let license_export_result = fetcher.license_export(id, db.as_ref()).await?;
+    if let Some(name_group_version) = license_export_result.sbom_name_group_version.clone() {
+        let exporter = LicenseExporter::new(
+            name_group_version.sbom_id.clone(),
+            name_group_version.sbom_name.clone(),
+            license_export_result.sbom_package_license,
+            license_export_result.extracted_licensing_infos,
+        );
+        let zip = exporter.generate()?;
+
+        Ok(HttpResponse::Ok()
+            .content_type(CONTENT_TYPE_GZIP)
+            .append_header((
+                "Content-Disposition",
+                format!(
+                    "attachment; filename=\"{}_licenses.tar.gz\"",
+                    get_sanitize_filename(name_group_version.sbom_name.clone())
+                ),
+            ))
+            .body(zip))
+    } else {
+        Ok(HttpResponse::NotFound().into())
+    }
+}
+
+/// Search for SBOMs
 #[utoipa::path(
     tag = "sbom",
     operation_id = "listSboms",
@@ -164,11 +216,12 @@ pub async fn count_related(
     Ok(HttpResponse::Ok().json(result))
 }
 
+/// Get information about an SBOM
 #[utoipa::path(
     tag = "sbom",
     operation_id = "getSbom",
     params(
-        ("id" = String, Path, description = "Digest/hash of the document, prefixed by hash type, such as 'sha256:<hash>' or 'urn:uuid:<uuid>'"),
+        ("id" = Id, Path),
     ),
     responses(
         (status = 200, description = "Matching SBOM", body = SbomSummary),
@@ -189,11 +242,12 @@ pub async fn get(
     }
 }
 
+/// Get advisories for an SBOM
 #[utoipa::path(
     tag = "sbom",
     operation_id = "getSbomAdvisories",
     params(
-        ("id" = String, Path, description = "Digest/hash of the document, prefixed by hash type, such as 'sha256:<hash>' or 'urn:uuid:<uuid>'"),
+        ("id" = Id, Path),
     ),
     responses(
         (status = 200, description = "Matching SBOM", body = Vec<SbomAdvisory>),
@@ -220,11 +274,12 @@ pub async fn get_sbom_advisories(
 
 all!(GetSbomAdvisories -> ReadSbom, ReadAdvisory);
 
+/// Delete an SBOM
 #[utoipa::path(
     tag = "sbom",
     operation_id = "deleteSbom",
     params(
-        ("id" = String, Path, description = "Digest/hash of the document, prefixed by hash type, such as 'sha256:<hash>' or 'urn:uuid:<uuid>'"),
+        ("id" = Id, Path),
     ),
     responses(
         (status = 200, description = "Matching SBOM", body = SbomSummary),
@@ -360,11 +415,10 @@ struct UploadQuery {
     request_body = Vec <u8>,
     params(
         UploadQuery,
-        ("location" = String, Query, description = "Source the document came from"),
     ),
     responses(
         (status = 201, description = "Upload an SBOM", body = IngestResult),
-        (status = 400, description = "The file could not be parsed as an advisory"),
+        (status = 400, description = "The file could not be parsed as an SBOM"),
     )
 )]
 #[post("/v2/sbom")]
@@ -383,11 +437,12 @@ pub async fn upload(
     Ok(HttpResponse::Created().json(result))
 }
 
+/// Download an SBOM
 #[utoipa::path(
     tag = "sbom",
     operation_id = "downloadSbom",
     params(
-        ("key" = String, Path, description = "Digest/hash of the document, prefixed by hash type, such as 'sha256:<hash>'"),
+        ("key" = Id, Path),
     ),
     responses(
         (status = 200, description = "Download a an SBOM", body = inline(BinaryData)),

@@ -1,7 +1,9 @@
 #![allow(clippy::expect_used)]
 
 mod delete;
+mod parallel;
 mod reingest;
+mod timeout;
 
 use csaf::Csaf;
 use csaf::definitions::ProductIdT;

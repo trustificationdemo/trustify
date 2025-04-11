@@ -26,10 +26,10 @@ use petgraph::{
     visit::{IntoNodeIdentifiers, VisitMap, Visitable},
 };
 use sea_orm::{
-    ColumnTrait, EntityOrSelect, EntityTrait, QueryFilter, QueryOrder, QuerySelect, RelationTrait,
-    prelude::ConnectionTrait,
+    ColumnTrait, DatabaseBackend, EntityOrSelect, EntityTrait, QueryFilter, QuerySelect,
+    RelationTrait, Statement, prelude::ConnectionTrait,
 };
-use sea_query::{JoinType, Order};
+use sea_query::JoinType;
 use std::{
     collections::{HashMap, HashSet},
     fmt::Debug,
@@ -64,12 +64,12 @@ struct ResolvedSbom {
 }
 
 async fn resolve_external_sbom<C: ConnectionTrait>(
-    external_node_ref: String,
+    node_id: String,
     connection: &C,
 ) -> Option<ResolvedSbom> {
     // we first lookup in sbom_external_node
     let sbom_external_node = match sbom_external_node::Entity::find()
-        .filter(sbom_external_node::Column::NodeId.eq(external_node_ref))
+        .filter(sbom_external_node::Column::NodeId.eq(node_id.as_str()))
         .one(connection)
         .await
     {
@@ -137,19 +137,33 @@ async fn resolve_external_sbom<C: ConnectionTrait>(
             // which is used on sbom_node_checksum to lookup related value then
             // perform another lookup on sbom_node_checksum (matching by value) to find resultant
             // sbom_id/node_id
-            let sbom_external_node_ref = sbom_external_node.external_node_ref;
+            resolve_rh_external_sbom_descendants(
+                sbom_external_node.sbom_id,
+                sbom_external_node.external_node_ref,
+                connection,
+            )
+            .await
+        }
+    }
+}
 
-            let Ok(Some(entity)) = sbom_node_checksum::Entity::find()
-                .filter(sbom_node_checksum::Column::NodeId.eq(sbom_external_node_ref.to_string()))
-                .one(connection)
-                .await
-            else {
-                return None;
-            };
-
+async fn resolve_rh_external_sbom_descendants<C: ConnectionTrait>(
+    sbom_external_sbom_id: Uuid,
+    sbom_external_node_ref: String,
+    connection: &C,
+) -> Option<ResolvedSbom> {
+    // find checksum value for the node
+    match sbom_node_checksum::Entity::find()
+        .filter(sbom_node_checksum::Column::NodeId.eq(sbom_external_node_ref.clone()))
+        .filter(sbom_node_checksum::Column::SbomId.eq(sbom_external_sbom_id))
+        .one(connection)
+        .await
+    {
+        Ok(Some(entity)) => {
+            // now find if there are any other other nodes with the same checksums
             match sbom_node_checksum::Entity::find()
-                .filter(sbom_node_checksum::Column::SbomId.ne(entity.sbom_id))
                 .filter(sbom_node_checksum::Column::Value.eq(entity.value.to_string()))
+                .filter(sbom_node_checksum::Column::SbomId.ne(entity.sbom_id))
                 .one(connection)
                 .await
             {
@@ -159,6 +173,48 @@ async fn resolve_external_sbom<C: ConnectionTrait>(
                 }),
                 _ => None,
             }
+        }
+        _ => None,
+    }
+}
+
+async fn resolve_rh_external_sbom_ancestors<C: ConnectionTrait>(
+    sbom_external_sbom_id: Uuid,
+    sbom_external_node_ref: String,
+    connection: &C,
+) -> Vec<ResolvedSbom> {
+    // find related checksum value(s) for the node, because any single component can be referred to by multiple
+    // sboms, this function returns a Vec<ResolvedSbom>.
+    match sbom_node_checksum::Entity::find()
+        .filter(sbom_node_checksum::Column::NodeId.eq(sbom_external_node_ref.clone()))
+        .filter(sbom_node_checksum::Column::SbomId.eq(sbom_external_sbom_id))
+        .one(connection)
+        .await
+    {
+        Ok(Some(entity)) => {
+            // now find if there are any other other nodes with the same checksums
+            match sbom_node_checksum::Entity::find()
+                .filter(sbom_node_checksum::Column::Value.eq(entity.value.to_string()))
+                .filter(sbom_node_checksum::Column::SbomId.ne(entity.sbom_id))
+                .all(connection)
+                .await
+            {
+                Ok(matches) => {
+                    let mut resolved_sboms: Vec<ResolvedSbom> = vec![];
+                    for matched in matches {
+                        resolved_sboms.push(ResolvedSbom {
+                            sbom_id: matched.sbom_id,
+                            node_id: matched.node_id,
+                        })
+                    }
+                    resolved_sboms
+                }
+
+                _ => vec![],
+            }
+        }
+        _ => {
+            vec![]
         }
     }
 }
@@ -214,8 +270,6 @@ impl AnalysisService {
 
         let distinct_sbom_ids = sbom::Entity::find()
             .select()
-            .order_by(sbom::Column::DocumentId, Order::Asc)
-            .order_by(sbom::Column::Published, Order::Desc)
             .all(connection)
             .await?
             .into_iter()
@@ -234,12 +288,7 @@ impl AnalysisService {
         &self,
         connection: &C,
     ) -> Result<AnalysisStatus, Error> {
-        let distinct_sbom_ids = sbom::Entity::find()
-            .select()
-            .order_by(sbom::Column::DocumentId, Order::Asc)
-            .order_by(sbom::Column::Published, Order::Desc)
-            .all(connection)
-            .await?;
+        let distinct_sbom_ids = sbom::Entity::find().select().all(connection).await?;
 
         Ok(AnalysisStatus {
             sbom_count: distinct_sbom_ids.len() as u32,
@@ -278,13 +327,14 @@ impl AnalysisService {
         .await
     }
 
-    #[instrument(skip(self, connection))]
+    #[instrument(skip(self, connection, graph_cache))]
     pub async fn run_graph_query<'a, C: ConnectionTrait>(
         &self,
         query: impl Into<GraphQuery<'a>> + Debug,
         options: QueryOptions,
         graphs: &[(String, Arc<PackageGraph>)],
         connection: &C,
+        graph_cache: Arc<GraphMap>,
     ) -> Vec<Node> {
         let relationships = options.relationships;
 
@@ -299,6 +349,7 @@ impl AnalysisService {
                 relationship: None,
                 ancestors: Box::pin(
                     Collector::new(
+                        &graph_cache,
                         graphs,
                         graph,
                         node_index,
@@ -312,6 +363,7 @@ impl AnalysisService {
                 .await,
                 descendants: Box::pin(
                     Collector::new(
+                        &graph_cache,
                         graphs,
                         graph,
                         node_index,
@@ -329,6 +381,7 @@ impl AnalysisService {
     }
 
     /// locate components, retrieve dependency information, from a single SBOM
+    /// TODO - this is only used by a test
     #[instrument(skip(self, connection), err)]
     pub async fn retrieve_single<C: ConnectionTrait>(
         &self,
@@ -345,7 +398,13 @@ impl AnalysisService {
 
         let graphs = self.load_graphs(connection, &distinct_sbom_ids).await?;
         let components = self
-            .run_graph_query(query, options, &graphs, connection)
+            .run_graph_query(
+                query,
+                options,
+                &graphs,
+                connection,
+                self.graph_cache.clone(),
+            )
             .await;
 
         Ok(paginated.paginate_array(&components))
@@ -364,11 +423,192 @@ impl AnalysisService {
         let options = options.into();
 
         let graphs = self.load_graphs_query(connection, query).await?;
+
         let components = self
-            .run_graph_query(query, options, &graphs, connection)
+            .run_graph_query(
+                query,
+                options,
+                &graphs,
+                connection,
+                self.graph_cache.clone(),
+            )
             .await;
 
         Ok(paginated.paginate_array(&components))
+    }
+
+    #[instrument(skip(self, connection), err)]
+    pub async fn retrieve_latest<C: ConnectionTrait>(
+        &self,
+        query: impl Into<GraphQuery<'_>> + Debug,
+        options: impl Into<QueryOptions> + Debug,
+        paginated: Paginated,
+        connection: &C,
+    ) -> Result<PaginatedResults<Node>, Error> {
+        let query = query.into();
+        let options = options.into();
+
+        let graphs = self.load_graphs_query(connection, query).await?;
+
+        let components = self
+            .run_graph_query(
+                query,
+                options,
+                &graphs,
+                connection,
+                self.graph_cache.clone(),
+            )
+            .await;
+
+        // This is a limited scope implementation of 'latest filtering' which performs a
+        // post-processing of a normal result set. The query type (name, cpe, purl or generic)
+        // determines
+        let latest_sbom_ids = match query {
+            GraphQuery::Component(ComponentReference::Id(name)) => {
+                let sql = r#"
+                    SELECT distinct sbom.sbom_id
+                    FROM sbom_node
+                    JOIN sbom ON sbom.sbom_id = sbom_node.sbom_id
+                    WHERE sbom_node.node_id = $1
+                    AND sbom.published = (
+                        SELECT MAX(published)
+                        FROM sbom
+                        JOIN sbom_node ON sbom.sbom_id = sbom_node.sbom_id
+                        WHERE sbom_node.node_id = $1
+                    );
+                "#;
+                let stmt =
+                    Statement::from_sql_and_values(DatabaseBackend::Postgres, sql, [name.into()]);
+                let rows = connection.query_all(stmt).await?;
+                rows.into_iter()
+                    .filter_map(|row| {
+                        row.try_get_by_index::<Uuid>(0)
+                            .ok()
+                            .map(|sbom_id| sbom_id.to_string())
+                    })
+                    .collect::<Vec<String>>()
+            }
+            GraphQuery::Component(ComponentReference::Name(name)) => {
+                let sql = r#"
+                    SELECT distinct sbom.sbom_id
+                    FROM sbom_node
+                    JOIN sbom ON sbom.sbom_id = sbom_node.sbom_id
+                    WHERE sbom_node.name = $1
+                    AND sbom.published = (
+                        SELECT MAX(published)
+                        FROM sbom
+                        JOIN sbom_node ON sbom.sbom_id = sbom_node.sbom_id
+                        WHERE sbom_node.name = $1
+                    );
+                "#;
+                let stmt =
+                    Statement::from_sql_and_values(DatabaseBackend::Postgres, sql, [name.into()]);
+                let rows = connection.query_all(stmt).await?;
+                rows.into_iter()
+                    .filter_map(|row| {
+                        row.try_get_by_index::<Uuid>(0)
+                            .ok()
+                            .map(|sbom_id| sbom_id.to_string())
+                    })
+                    .collect::<Vec<String>>()
+            }
+            GraphQuery::Component(ComponentReference::Purl(purl)) => {
+                let sql = r#"
+                    SELECT distinct sbom.sbom_id
+                    FROM sbom_package_purl_ref
+                    JOIN sbom ON sbom.sbom_id = sbom_package_purl_ref.sbom_id
+                    WHERE sbom_package_purl_ref.qualified_purl_id = $1
+                    AND sbom.published = (
+                        SELECT MAX(published)
+                        FROM sbom
+                        JOIN sbom_package_purl_ref ON sbom.sbom_id = sbom_package_purl_ref.sbom_id
+                        WHERE sbom_package_purl_ref.qualified_purl_id = $1
+                    );
+                "#;
+                let stmt = Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    sql,
+                    [purl.qualifier_uuid().into()],
+                );
+                let rows = connection.query_all(stmt).await?;
+                rows.into_iter()
+                    .filter_map(|row| {
+                        row.try_get_by_index::<Uuid>(0)
+                            .ok()
+                            .map(|sbom_id| sbom_id.to_string())
+                    })
+                    .collect::<Vec<String>>()
+            }
+            GraphQuery::Component(ComponentReference::Cpe(cpe)) => {
+                let sql = r#"
+                    SELECT distinct sbom.sbom_id
+                    FROM sbom_package_cpe_ref
+                    JOIN sbom ON sbom.sbom_id = sbom_package_cpe_ref.sbom_id
+                    WHERE sbom_package_cpe_ref.cpe_id = $1
+                    AND sbom.published = (
+                        SELECT MAX(published)
+                        FROM sbom
+                        JOIN sbom_package_cpe_ref ON sbom.sbom_id = sbom_package_cpe_ref.sbom_id
+                        WHERE sbom_package_cpe_ref.cpe_id = $1
+                    );
+                "#;
+                let stmt = Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    sql,
+                    [cpe.uuid().into()],
+                );
+                let rows = connection.query_all(stmt).await?;
+                rows.into_iter()
+                    .filter_map(|row| {
+                        row.try_get_by_index::<Uuid>(0)
+                            .ok()
+                            .map(|sbom_id| sbom_id.to_string())
+                    })
+                    .collect::<Vec<String>>()
+            }
+            GraphQuery::Query(query) => {
+                // TODO - when we formally define 'latest authoratative filters' this area will become
+                //        much more complex ... for now we are happy with just searching node_id with
+                //        LIKE matches.
+                let sql = r#"
+                    SELECT distinct sbom.sbom_id
+                    FROM sbom_node
+                    JOIN sbom ON sbom.sbom_id = sbom_node.sbom_id
+                    WHERE sbom_node.node_id ~ $1
+                    AND sbom.published = (
+                        SELECT MAX(published)
+                        FROM sbom
+                        JOIN sbom_node ON sbom.sbom_id = sbom_node.sbom_id
+                        WHERE sbom_node.node_id ~ $1
+                    );
+                "#;
+                let stmt = Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    sql,
+                    [query.clone().q.into()],
+                );
+                let rows = connection.query_all(stmt).await?;
+                rows.into_iter()
+                    .filter_map(|row| {
+                        row.try_get_by_index::<Uuid>(0)
+                            .ok()
+                            .map(|sbom_id| sbom_id.to_string())
+                    })
+                    .collect::<Vec<String>>()
+            }
+        };
+
+        log::debug!("Latest sbom IDs: {:?}", latest_sbom_ids);
+
+        // filter initial set of top level matched nodes by latest_sbom_ids which will ensure
+        // our 'starting points' are on nodes that are from latest sboms
+        let mut latest_components = vec![];
+        for component in components {
+            if latest_sbom_ids.contains(&component.sbom_id) {
+                latest_components.push(component);
+            }
+        }
+        Ok(paginated.paginate_array(&latest_components))
     }
 
     /// check if a node in the graph matches the provided query
@@ -393,19 +633,18 @@ impl AnalysisService {
                 })
             }
             GraphQuery::Query(query) => graph.node_weight(i).is_some_and(|node| {
-                let purls: Vec<_> = match node {
-                    graph::Node::Package(p) => p.purl.iter().map(|p| p.to_string()).collect(),
-                    _ => vec![],
-                };
                 let mut context = HashMap::from([
                     ("sbom_id", Value::String(&node.sbom_id)),
                     ("node_id", Value::String(&node.node_id)),
                     ("name", Value::String(&node.name)),
-                    ("purl", Value::from(&purls)),
                 ]);
                 match node {
                     graph::Node::Package(package) => {
-                        context.extend([("version", Value::String(&package.version))]);
+                        context.extend([
+                            ("version", Value::String(&package.version)),
+                            ("purl", Value::from(&package.purl)),
+                            ("cpe", Value::from(&package.cpe)),
+                        ]);
                     }
                     graph::Node::External(external) => {
                         context.extend([

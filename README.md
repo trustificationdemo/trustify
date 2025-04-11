@@ -1,6 +1,33 @@
-# trustify
+# Trustify
 
 [![ci](https://github.com/trustification/trustify/actions/workflows/ci.yaml/badge.svg)](https://github.com/trustification/trustify/actions/workflows/ci.yaml)
+
+Trustify provides a single, searchable abstraction over all cyclonedx/spdx SBOMs - cross referencing against public security advisories to help identify and respond to software security threats & vulnerabilities.
+
+## How Trustify Helps
+Trustify tackles some of the problems developers and companies face when keeping software safe and organized. Here’s how it helps:
+- Deploy applications with fewer vulnerabilities
+- Meet compliance regulations for SBOM management and archiving
+- Know that trusted components are in use as early as possible
+- Reduce alert fatigue with fewer false positive by getting vendor vulnerability information from the actual vendor (VEX) 
+- Analyze applications without downloading and installing
+
+## Architecture
+Trustify is an evolution of the [Trustification](https://github.com/trustification) project.
+We changed the architecture to [modulith](https://dzone.com/articles/architecture-style-modulith-vs-microservices) approach, to build a simpler-to-deploy more responsive system that can flexibly meet the needs of the company and our customers going forward.
+
+The general architecture is as follows:
+
+### The System 
+- REST APIs to support operations for ingesting and retrieving supply-chain data.
+- Comes with a set of default importers to public available vulnerability data
+
+### A single SQL database
+- PostgreSQL.
+- Extensible data-model to support all aspects of supply-chain data.
+- OIDC provider 
+
+![image](https://github.com/user-attachments/assets/f251c0ef-9693-485c-9ebd-8deefe2c244c)
 
 ## Quick start
 
@@ -236,3 +263,15 @@ All package/product relationships exist only within the context of an SBOM makin
 ### Describes
 
 CPE (Product?) and/or pURLs described by the SBOM
+
+## Related Projects
+
+* [Trustify user interface](https://github.com/trustification/trustify-ui)
+* [Helm charts used for the Trustify deployment](https://github.com/trustification/trustify-helm-charts)
+* [OpenShift Operator used for the Trustify deployment](https://github.com/trustification/trustify-operator)
+* [Ansible playbooks used for the Trustify deployment](https://github.com/trustification/trustify-ansible)
+* [Trustify API & user interface test suite](https://github.com/trustification/trustify-tests)
+* [Trustify load tests runner](https://github.com/trustification/trustify-load-test-runs)
+* [Trustify load test suite](https://github.com/trustification/scale-testing)
+* [Trustify GitHub CI helpers](https://github.com/trustification/trustify-ci)
+* [Trustify release tools](https://github.com/trustification/release-tools)

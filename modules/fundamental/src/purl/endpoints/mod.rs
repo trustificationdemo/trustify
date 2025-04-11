@@ -16,8 +16,6 @@ use trustify_common::{
 };
 
 mod base;
-mod r#type;
-mod version;
 
 pub fn configure(config: &mut utoipa_actix_web::service_config::ServiceConfig, db: Database) {
     let purl_service = PurlService::new();
@@ -25,13 +23,8 @@ pub fn configure(config: &mut utoipa_actix_web::service_config::ServiceConfig, d
     config
         .app_data(web::Data::new(db))
         .app_data(web::Data::new(purl_service))
-        .service(r#type::all_purl_types)
-        .service(r#type::get_purl_type)
-        .service(r#type::get_base_purl_of_type)
-        .service(r#type::get_versioned_purl_of_type)
         .service(base::get_base_purl)
         .service(base::all_base_purls)
-        .service(version::get_versioned_purl)
         .service(get)
         .service(all);
 }

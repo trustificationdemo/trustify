@@ -2,7 +2,7 @@ pub mod context;
 pub(crate) mod progress;
 
 use crate::{
-    model::Importer,
+    model::{Importer, State},
     runner::{
         ImportRunner,
         common::heartbeat::Heart,
@@ -11,6 +11,7 @@ use crate::{
     server::context::ServiceRunContext,
     service::{Error, ImporterService},
 };
+use opentelemetry::global;
 use std::{path::PathBuf, time::Duration};
 use time::OffsetDateTime;
 use tokio::{task::LocalSet, time::MissedTickBehavior};
@@ -72,6 +73,9 @@ impl Server {
     }
 
     async fn run_local(self) -> anyhow::Result<()> {
+        let meter = global::meter("importer::Server");
+        let running_importers = meter.u64_gauge("running_importers").build();
+
         let service = ImporterService::new(self.db.clone());
         let runner = ImportRunner {
             db: self.db.clone(),
@@ -92,11 +96,17 @@ impl Server {
             runs.retain(|heart| heart.is_beating());
             let count = runs.len();
 
+            // Update metrics
+            running_importers.record(count as _, &[]);
+
+            let importers = service.list().await?;
+
+            // Update any importers that we assume have crashed
+            reap(&importers, &service).await?;
+
             // Asynchronously fire off new jobs subject to max concurrency
             runs.extend(
-                service
-                    .list()
-                    .await?
+                importers
                     .into_iter()
                     .filter(|i| i.is_enabled() && i.is_due() && !i.is_running())
                     .take(self.concurrency - count)
@@ -167,5 +177,29 @@ async fn import(
         )
         .await?;
 
+    Ok(())
+}
+
+async fn reap(importers: &[Importer], service: &ImporterService) -> anyhow::Result<()> {
+    for importer in importers
+        .iter()
+        .filter(|i| i.data.state == State::Running && !i.is_running())
+    {
+        log::info!(
+            "Reaping stale importer job: {} (since: {})",
+            importer.name,
+            importer.data.last_change
+        );
+        service
+            .update_finish(
+                &importer.name,
+                None,
+                importer.data.last_run.unwrap_or(importer.data.last_change),
+                Some("Import aborted".into()),
+                None,
+                None,
+            )
+            .await?;
+    }
     Ok(())
 }

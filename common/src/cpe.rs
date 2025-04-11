@@ -2,13 +2,14 @@ use cpe::{
     cpe::Cpe as _,
     uri::{OwnedUri, Uri},
 };
-use deepsize::DeepSizeOf;
+use deepsize::{Context, DeepSizeOf};
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
     de::{Error, Visitor},
 };
 use std::{
     borrow::Cow,
+    cmp::Ordering,
     fmt::{Debug, Display, Formatter},
     str::FromStr,
 };
@@ -18,9 +19,41 @@ use utoipa::{
 };
 use uuid::Uuid;
 
-#[derive(Clone, Hash, Eq, PartialEq, DeepSizeOf)]
+use crate::db::query::Valuable;
+
+#[derive(Clone, Hash, Eq, PartialEq)]
 pub struct Cpe {
     uri: OwnedUri,
+}
+
+impl DeepSizeOf for Cpe {
+    fn deep_size_of_children(&self, context: &mut Context) -> usize {
+        fn comp(value: cpe::component::Component, ctx: &mut Context) -> usize {
+            if let cpe::component::Component::Value(v) = value {
+                v.deep_size_of_children(ctx)
+            } else {
+                0
+            }
+        }
+
+        fn lang(lang: &cpe::cpe::Language, ctx: &mut Context) -> usize {
+            if let cpe::cpe::Language::Language(v) = lang {
+                v.as_str().deep_size_of_children(ctx)
+            } else {
+                0
+            }
+        }
+
+        comp(self.uri.vendor(), context)
+            + comp(self.uri.product(), context)
+            + comp(self.uri.version(), context)
+            + comp(self.uri.update(), context)
+            + comp(self.uri.edition(), context)
+            + comp(self.uri.sw_edition(), context)
+            + comp(self.uri.target_sw(), context)
+            + comp(self.uri.other(), context)
+            + lang(self.uri.language(), context)
+    }
 }
 
 impl ToSchema for Cpe {
@@ -59,6 +92,31 @@ impl<'de> Deserialize<'de> for Cpe {
         D: Deserializer<'de>,
     {
         deserializer.deserialize_str(CpeVisitor)
+    }
+}
+
+impl Valuable for Cpe {
+    fn like(&self, other: &str) -> bool {
+        match Cpe::from_str(other) {
+            Ok(cpe) => cpe.uri.is_superset(&self.uri),
+            _ => self.to_string().contains(other),
+        }
+    }
+}
+impl PartialOrd<String> for Cpe {
+    fn partial_cmp(&self, other: &String) -> Option<Ordering> {
+        match Cpe::from_str(other) {
+            Ok(cpe) if self.eq(&cpe) => Some(Ordering::Equal),
+            _ => self.to_string().partial_cmp(other),
+        }
+    }
+}
+impl PartialEq<String> for Cpe {
+    fn eq(&self, other: &String) -> bool {
+        match Cpe::from_str(other) {
+            Ok(p) => self.eq(&p),
+            _ => self.to_string().eq(other),
+        }
     }
 }
 

@@ -1,25 +1,14 @@
-use std::env;
 use test_context::test_context;
 use test_log::test;
 use tracing::instrument;
 use trustify_cvss::cvss3::severity::Severity;
-use trustify_module_fundamental::sbom::model::details::SbomDetails;
-use trustify_module_fundamental::sbom::service::SbomService;
+use trustify_module_fundamental::sbom::{model::details::SbomDetails, service::SbomService};
 use trustify_test_context::TrustifyContext;
 
 #[test_context(TrustifyContext)]
 #[test(tokio::test)]
 #[instrument]
 async fn sbom_details_cyclonedx_osv(ctx: &TrustifyContext) -> Result<(), anyhow::Error> {
-    // get the env var RUST_MIN_STACK and make sure it set to 50000000
-    let stack_size = env::var("RUST_MIN_STACK").unwrap_or("".to_string());
-    if stack_size != "50000000" {
-        println!(
-            "skipping sbom_details_cyclonedx_osv test, RUST_MIN_STACK=50000000 env var is not set"
-        );
-        return Ok(());
-    }
-
     let sbom = SbomService::new(ctx.db.clone());
 
     // ingest the SBOM
@@ -81,6 +70,12 @@ async fn sbom_details_cyclonedx_osv(ctx: &TrustifyContext) -> Result<(), anyhow:
     let maven = ctx.ingest_document("osv/GHSA-qq9f-q439-2574.json").await?;
     assert_eq!(maven.document_id, Some("GHSA-qq9f-q439-2574".to_string()));
 
+    let maven_not_affecting = ctx.ingest_document("osv/GHSA-458h-wv48-fq75.json").await?;
+    assert_eq!(
+        maven_not_affecting.document_id,
+        Some("GHSA-458h-wv48-fq75".to_string())
+    );
+
     let sbom1 = sbom
         .fetch_sbom_details(result1.id, vec![], &ctx.db)
         .await?
@@ -110,7 +105,7 @@ async fn sbom_details_cyclonedx_osv(ctx: &TrustifyContext) -> Result<(), anyhow:
         &sbom1,
         "GHSA-2ccf-ffrj-m4qw",
         "CVE-2023-29020",
-        Severity::High,
+        Severity::Medium,
     );
     check_advisory(
         &sbom1,
@@ -128,7 +123,7 @@ async fn sbom_details_cyclonedx_osv(ctx: &TrustifyContext) -> Result<(), anyhow:
         &sbom1,
         "GHSA-cvw2-xj8r-mjf7",
         "CVE-2019-25025",
-        Severity::High,
+        Severity::Medium,
     );
     check_advisory(
         &sbom1,
@@ -146,7 +141,7 @@ async fn sbom_details_cyclonedx_osv(ctx: &TrustifyContext) -> Result<(), anyhow:
         &sbom1,
         "GHSA-fmj7-7gfw-64pg",
         "CVE-2024-48915",
-        Severity::Medium,
+        Severity::None,
     );
     check_advisory(
         &sbom1,
@@ -181,6 +176,9 @@ fn check_advisory(
         vulnerability_id,
         advisory.status[0].vulnerability.identifier
     );
-    assert_eq!(severity, advisory.status[0].average_severity);
+    assert_eq!(
+        severity, advisory.status[0].average_severity,
+        "advisory={advisory_id}, vulnerability={vulnerability_id}"
+    );
     assert_eq!("affected", advisory.status[0].status);
 }

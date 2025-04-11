@@ -294,6 +294,8 @@ impl PurlService {
         paginated: Paginated,
         connection: &C,
     ) -> Result<PaginatedResults<PurlSummary>, Error> {
+        // use sea_orm::{ColumnType, IntoIdentity};
+        // use sea_query::{Expr, Func, SimpleExpr};
         let limiter = qualified_purl::Entity::find()
             .filtering_with(
                 query,
@@ -305,13 +307,21 @@ impl PurlService {
                         "type" => Some(format!("ty{op}{v}")),
                         _ => None,
                     }),
+                // .add_expr(
+                //     "purl",
+                //     SimpleExpr::FunctionCall(
+                //         Func::cust("get_purl".into_identity())
+                //             .arg(Expr::col(qualified_purl::Column::Id)),
+                //     ),
+                //     ColumnType::Text,
+                // ),
             )?
             .limiting(connection, paginated.offset, paginated.limit);
 
         let total = limiter.total().await?;
 
         Ok(PaginatedResults {
-            items: PurlSummary::from_entities(&limiter.fetch().await?, connection).await?,
+            items: PurlSummary::from_entities(&limiter.fetch().await?),
             total,
         })
     }

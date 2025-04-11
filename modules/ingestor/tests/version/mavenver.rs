@@ -70,6 +70,38 @@ async fn test_mavenver_cmp(ctx: &TrustifyContext) -> Result<(), anyhow::Error> {
     assert_eq!(Some(-1), mavenver_cmp(&ctx.db, "1.8-1", "1.8.0-3").await?);
     assert_eq!(Some(1), mavenver_cmp(&ctx.db, "1.8-3", "1.8.0-1").await?);
 
+    assert_eq!(
+        Some(-1),
+        mavenver_cmp(&ctx.db, "4.1.108.Final", "4.1.108.Final-redhat-0001").await?
+    );
+    assert_eq!(
+        Some(-1),
+        mavenver_cmp(
+            &ctx.db,
+            "4.1.108.Alpha-redhat-0001",
+            "4.1.108.Final-redhat-0001"
+        )
+        .await?
+    );
+    assert_eq!(
+        Some(0),
+        mavenver_cmp(
+            &ctx.db,
+            "4.1.108.Final-redhat-0001",
+            "4.1.108.Final-redhat-0001"
+        )
+        .await?
+    );
+    assert_eq!(
+        Some(-1),
+        mavenver_cmp(
+            &ctx.db,
+            "4.1.108.Final-redhat-0001",
+            "4.1.108.Final-redhat-0002"
+        )
+        .await?
+    );
+
     Ok(())
 }
 
@@ -220,6 +252,19 @@ async fn test_version_matches_netty_codec(ctx: TrustifyContext) -> Result<(), an
             &db,
             "4.1.108.Final-redhat-0001",
             VersionRange::Range(Version::Inclusive("4.1.108"), Version::Exclusive("4.2")),
+            "maven"
+        )
+        .await?
+    );
+
+    assert!(
+        !version_matches(
+            &db,
+            "4.1.108.Final-redhat-0001",
+            VersionRange::Range(
+                Version::Inclusive("0.0"),
+                Version::Exclusive("4.1.108.Final")
+            ),
             "maven"
         )
         .await?

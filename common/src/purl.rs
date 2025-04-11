@@ -1,14 +1,14 @@
 use deepsize::DeepSizeOf;
 use packageurl::PackageUrl;
-use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
+use sea_orm::FromJsonQueryResult;
 use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
     de::{Error, Visitor},
 };
-use std::borrow::Cow;
+use std::{borrow::Cow, cmp::Ordering};
 use std::{
     collections::BTreeMap,
-    fmt::{Debug, Display, Formatter},
+    fmt::{self, Debug, Display, Formatter},
     hash::Hash,
     str::FromStr,
 };
@@ -18,6 +18,8 @@ use utoipa::{
 };
 use uuid::Uuid;
 
+use crate::db::query::Valuable;
+
 #[derive(Debug, thiserror::Error)]
 pub enum PurlErr {
     #[error("missing version {0}")]
@@ -26,13 +28,38 @@ pub enum PurlErr {
     Package(#[from] packageurl::Error),
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, DeepSizeOf)]
+#[derive(Clone, PartialEq, Eq, Hash, DeepSizeOf, FromJsonQueryResult)]
 pub struct Purl {
     pub ty: String,
     pub namespace: Option<String>,
     pub name: String,
     pub version: Option<String>,
     pub qualifiers: BTreeMap<String, String>,
+}
+
+impl Valuable for Purl {
+    fn like(&self, pat: &str) -> bool {
+        match urlencoding::decode(pat) {
+            Ok(s) => self.to_string().contains(&s.into_owned()),
+            _ => false,
+        }
+    }
+}
+impl PartialOrd<String> for Purl {
+    fn partial_cmp(&self, other: &String) -> Option<Ordering> {
+        match Purl::from_str(other) {
+            Ok(purl) if self.eq(&purl) => Some(Ordering::Equal),
+            _ => self.to_string().partial_cmp(other),
+        }
+    }
+}
+impl PartialEq<String> for Purl {
+    fn eq(&self, other: &String) -> bool {
+        match Purl::from_str(other) {
+            Ok(p) => self.eq(&p),
+            _ => self.to_string().eq(other),
+        }
+    }
 }
 
 impl ToSchema for Purl {
@@ -55,6 +82,13 @@ const NAMESPACE: Uuid = Uuid::from_bytes([
 ]);
 
 impl Purl {
+    // clone from self with the passed version
+    pub fn with_version<T: ToString>(&self, version: T) -> Self {
+        let mut result = self.clone();
+        result.version = Some(version.to_string());
+        result
+    }
+
     pub fn package_uuid(&self) -> Uuid {
         let mut result = Uuid::new_v5(&NAMESPACE, self.ty.as_bytes());
         if let Some(namespace) = &self.namespace {
@@ -96,6 +130,28 @@ impl Purl {
         let version = self.then_version_uuid(&package);
         let qualified = self.then_qualifier_uuid(&version);
         (package, version, qualified)
+    }
+
+    /// Create a new instance with only the base information
+    pub fn to_base(&self) -> Self {
+        Self {
+            ty: self.ty.clone(),
+            name: self.name.clone(),
+            namespace: self.namespace.clone(),
+            version: None,
+            qualifiers: Default::default(),
+        }
+    }
+
+    /// Create a new instance with only the version information
+    pub fn to_version(&self) -> Self {
+        Self {
+            ty: self.ty.clone(),
+            name: self.name.clone(),
+            namespace: self.namespace.clone(),
+            version: self.version.clone(),
+            qualifiers: Default::default(),
+        }
     }
 }
 
@@ -144,67 +200,19 @@ impl Visitor<'_> for PurlVisitor {
     }
 }
 
-const QUERY_ENCODE_SET: &AsciiSet = &CONTROLS
-    .add(b' ') // Space must be encoded as %20 or +.
-    .add(b'"') // Double quote
-    .add(b'#') // Fragment identifier
-    .add(b'<') // Less than
-    .add(b'>') // Greater than
-    .add(b'[') // Left square bracket
-    .add(b']') // Right square bracket
-    .add(b'{') // Left curly brace
-    .add(b'}') // Right curly brace
-    .add(b'|') // Pipe
-    .add(b'\\') // Backslash
-    .add(b'^') // Caret
-    .add(b'`') // Backtick
-    .add(b'~') // Tilde
-    .add(b'@') // At sign
-    .add(b'!') // Exclamation mark
-    .add(b'$') // Dollar sign
-    .add(b'&') // Ampersand
-    .add(b'\'') // Single quote
-    .add(b'(') // Left parenthesis
-    .add(b')') // Right parenthesis
-    .add(b'*') // Asterisk
-    .add(b'+') // Plus
-    .add(b',') // Comma
-    .add(b';') // Semicolon
-    .add(b'=') // Equals
-    .add(b'%'); // Percent itself.
-
 impl Display for Purl {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let ns = if let Some(ns) = &self.namespace {
-            format!("/{}", ns)
-        } else {
-            "".to_string()
-        };
-
-        let qualifiers = if self.qualifiers.is_empty() {
-            "".to_string()
-        } else {
-            format!(
-                "?{}",
-                self.qualifiers
-                    .iter()
-                    .map(|(k, v)| format!("{}={}", k, utf8_percent_encode(v, QUERY_ENCODE_SET)))
-                    .collect::<Vec<_>>()
-                    .join("&")
-            )
-        };
-
-        let version = if let Some(version) = &self.version {
-            format!("@{}", version)
-        } else {
-            "".to_string()
-        };
-
-        write!(
-            f,
-            "pkg:{}{}/{}{}{}",
-            self.ty, ns, self.name, version, qualifiers
-        )
+        let mut purl = PackageUrl::new(&self.ty, &self.name).map_err(|_| fmt::Error)?;
+        if let Some(ns) = &self.namespace {
+            purl.with_namespace(ns);
+        }
+        if let Some(version) = &self.version {
+            purl.with_version(version);
+        }
+        for (key, value) in &self.qualifiers {
+            purl.add_qualifier(key, value).map_err(|_| fmt::Error)?;
+        }
+        Display::fmt(&purl, f)
     }
 }
 
@@ -387,6 +395,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(purl1, purl2);
+        Ok(())
+    }
+
+    #[test(tokio::test)]
+    async fn purl_encoding() -> Result<(), anyhow::Error> {
+        let purl = Purl::from_str("pkg:npm/@fastify/this@that@3.8-%236.el8")?;
+        assert_eq!(
+            purl.to_string().as_str(),
+            "pkg:npm/%40fastify/this%40that@3.8-%236.el8"
+        );
+
         Ok(())
     }
 }

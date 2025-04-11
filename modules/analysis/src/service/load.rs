@@ -1,26 +1,35 @@
+use crate::service::resolve_external_sbom;
 use crate::{
     Error,
     model::{PackageGraph, graph},
     service::{AnalysisService, ComponentReference, GraphQuery},
 };
+use ::cpe::{
+    component::Component,
+    cpe::{Cpe, CpeType, Language},
+    uri::OwnedUri,
+};
 use anyhow::anyhow;
 use petgraph::{Graph, prelude::NodeIndex};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseBackend, DbErr, EntityOrSelect, EntityTrait,
-    FromQueryResult, QueryFilter, QueryOrder, QuerySelect, QueryTrait, RelationTrait, Statement,
+    ColumnTrait, ColumnType, ConnectionTrait, DatabaseBackend, DbErr, EntityOrSelect, EntityTrait,
+    FromQueryResult, IntoIdentity, QueryFilter, QueryOrder, QuerySelect, QueryTrait, RelationTrait,
+    Statement,
 };
-use sea_query::{JoinType, Order, SelectStatement};
+use sea_query::{Expr, Func, JoinType, Order, SelectStatement, SimpleExpr};
 use serde_json::Value;
+use std::str::FromStr;
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
     sync::Arc,
 };
 use tracing::{Level, instrument};
-use trustify_common::{cpe::Cpe, db::query::Filtering, purl::Purl};
+use trustify_common::db::query::IntoColumns;
+use trustify_common::{cpe::Cpe as TrustifyCpe, db::query::Filtering, purl::Purl};
 use trustify_entity::{
-    cpe::CpeDto, package_relates_to_package, relationship::Relationship, sbom,
-    sbom_external_node::ExternalType, sbom_node, sbom_package, sbom_package_cpe_ref,
-    sbom_package_purl_ref,
+    cpe, cpe::CpeDto, package_relates_to_package, relationship::Relationship, sbom,
+    sbom_external_node, sbom_external_node::ExternalType, sbom_node, sbom_package,
+    sbom_package_cpe_ref, sbom_package_purl_ref,
 };
 use uuid::Uuid;
 
@@ -187,13 +196,13 @@ fn to_purls(purls: Option<Vec<String>>) -> Vec<Purl> {
         .collect()
 }
 
-fn to_cpes(cpes: Option<Vec<Value>>) -> Vec<Cpe> {
+fn to_cpes(cpes: Option<Vec<Value>>) -> Vec<TrustifyCpe> {
     cpes.into_iter()
         .flatten()
         .flat_map(|cpe| {
             serde_json::from_value::<CpeDto>(cpe)
                 .ok()
-                .and_then(|cpe| Cpe::try_from(cpe).ok())
+                .and_then(|cpe| TrustifyCpe::try_from(cpe).ok())
         })
         .collect()
 }
@@ -216,7 +225,7 @@ impl AnalysisService {
             GraphQuery::Component(ComponentReference::Name(name)) => sbom_node::Entity::find()
                 .filter(sbom_node::Column::Name.eq(name))
                 .select_only()
-                .column(sbom_node::Column::SbomId)
+                .column(sbom::Column::SbomId)
                 .distinct()
                 .into_query(),
             GraphQuery::Component(ComponentReference::Purl(purl)) => sbom_node::Entity::find()
@@ -236,9 +245,59 @@ impl AnalysisService {
                 .distinct()
                 .into_query(),
             GraphQuery::Query(query) => sbom_node::Entity::find()
-                .filtering(query.clone())?
+                .join(JoinType::Join, sbom_node::Relation::Package.def())
+                .join(JoinType::LeftJoin, sbom_package::Relation::Purl.def())
+                .join(JoinType::LeftJoin, sbom_package::Relation::Cpe.def())
+                .join(
+                    JoinType::LeftJoin,
+                    sbom_package_cpe_ref::Relation::Cpe.def(),
+                )
                 .select_only()
                 .column(sbom_node::Column::SbomId)
+                .filtering_with(
+                    query.clone(),
+                    sbom_node::Entity
+                        .columns()
+                        .add_columns(cpe::Entity.columns())
+                        .translator(|f, op, v| {
+                            match (f, op, OwnedUri::from_str(v)) {
+                                ("cpe", "=" | "~", Ok(cpe)) => {
+                                    // We break out cpe into its constituent columns in CPE table
+                                    let q = match (cpe.part(), cpe.language()) {
+                                        (CpeType::Any, Language::Any) => String::new(),
+                                        (CpeType::Any, l) => format!("language={l}"),
+                                        (p, Language::Any) => format!("part={p}"),
+                                        (p, l) => format!("part={p}&language={l}"),
+                                    };
+                                    let translated = [
+                                        ("vendor", cpe.vendor()),
+                                        ("product", cpe.product()),
+                                        ("version", cpe.version()),
+                                        ("update", cpe.update()),
+                                        ("edition", cpe.edition()),
+                                    ]
+                                    .iter()
+                                    .fold(q, |acc, (k, v)| match v {
+                                        Component::Value(s) => format!("{acc}&{k}={s}|*"),
+                                        _ => acc,
+                                    });
+                                    Some(translated)
+                                }
+                                ("cpe", "~", Err(_)) => Some(v.into()),
+                                ("cpe", _, Err(e)) => Some(e.to_string()),
+                                ("cpe", _, _) => Some("illegal operation for cpe".into()),
+                                _ => None,
+                            }
+                        })
+                        .add_expr(
+                            "purl",
+                            SimpleExpr::FunctionCall(
+                                Func::cust("get_purl".into_identity())
+                                    .arg(Expr::col(sbom_package_purl_ref::Column::QualifiedPurlId)),
+                            ),
+                            ColumnType::Text,
+                        ),
+                )?
                 .distinct()
                 .into_query(),
         };
@@ -274,6 +333,8 @@ impl AnalysisService {
         connection: &C,
         distinct_sbom_id: &str,
     ) -> Result<Arc<PackageGraph>, Error> {
+        log::debug!("loading sbom: {:?}", distinct_sbom_id);
+
         if let Some(g) = self.graph_cache.get(distinct_sbom_id) {
             // early return if we already loaded it
             return Ok(g);
@@ -383,6 +444,28 @@ impl AnalysisService {
     ) -> Result<Vec<(String, Arc<PackageGraph>)>, Error> {
         let mut results = Vec::new();
         for distinct_sbom_id in distinct_sbom_ids {
+            // TODO: we need a better heuristic for loading external sboms
+            let external_sboms = sbom_external_node::Entity::find().all(connection).await?;
+            for external_sbom in &external_sboms {
+                if !distinct_sbom_id.eq(&external_sbom.node_id.to_string()) {
+                    let resolved_external_sbom =
+                        resolve_external_sbom(external_sbom.node_id.to_string(), connection).await;
+                    log::debug!("resolved external sbom: {:?}", resolved_external_sbom);
+                    if let Some(resolved_external_sbom) = resolved_external_sbom {
+                        let resolved_external_sbom_id = resolved_external_sbom.clone().sbom_id;
+                        results.push((
+                            resolved_external_sbom_id.clone().to_string(),
+                            self.load_graph(connection, &resolved_external_sbom_id.to_string())
+                                .await?,
+                        ));
+                    } else {
+                        log::debug!("Cannot find external sbom {:?}", external_sbom.node_id);
+                        continue;
+                    }
+                }
+            }
+            log::debug!("loading sbom: {:?}", distinct_sbom_id);
+
             results.push((
                 distinct_sbom_id.clone(),
                 self.load_graph(connection, distinct_sbom_id).await?,

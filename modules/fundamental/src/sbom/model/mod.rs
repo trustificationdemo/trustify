@@ -8,13 +8,14 @@ use async_graphql::SimpleObject;
 use sea_orm::{ConnectionTrait, ModelTrait, PaginatorTrait, prelude::Uuid};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
+use tracing::instrument;
 use trustify_common::{cpe::Cpe, model::Paginated, purl::Purl};
 use trustify_entity::{
     labels::Labels, relationship::Relationship, sbom, sbom_node, sbom_package, source_document,
 };
 use utoipa::ToSchema;
 
-#[derive(Serialize, Deserialize, Debug, Clone, ToSchema)]
+#[derive(Serialize, Deserialize, Debug, Clone, ToSchema, Default)]
 pub struct SbomHead {
     #[serde(with = "uuid::serde::urn")]
     #[schema(value_type=String)]
@@ -28,7 +29,10 @@ pub struct SbomHead {
     #[serde(with = "time::serde::rfc3339::option")]
     pub published: Option<OffsetDateTime>,
 
+    /// Authors of the SBOM
     pub authors: Vec<String>,
+    /// Suppliers of the SBOMs content
+    pub suppliers: Vec<String>,
 
     pub name: String,
 
@@ -49,6 +53,7 @@ impl SbomHead {
             labels: sbom.labels.clone(),
             published: sbom.published,
             authors: sbom.authors.clone(),
+            suppliers: sbom.suppliers.clone(),
             name: sbom_node
                 .map(|node| node.name.clone())
                 .unwrap_or("".to_string()),
@@ -70,6 +75,7 @@ pub struct SbomSummary {
 }
 
 impl SbomSummary {
+    #[instrument(skip(service, db), err(level=tracing::Level::INFO))]
     pub async fn from_entity<C: ConnectionTrait>(
         (sbom, node): (sbom::Model, Option<sbom_node::Model>),
         service: &SbomService,
@@ -86,11 +92,7 @@ impl SbomSummary {
         Ok(match node {
             Some(_) => Some(SbomSummary {
                 head: SbomHead::from_entity(&sbom, node, db).await?,
-                source_document: if let Some(doc) = &source_document {
-                    Some(SourceDocument::from_entity(doc).await?)
-                } else {
-                    None
-                },
+                source_document: source_document.as_ref().map(SourceDocument::from_entity),
                 described_by,
             }),
             None => None,
@@ -101,11 +103,18 @@ impl SbomSummary {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, ToSchema, SimpleObject, Default)]
 #[graphql(concrete(name = "SbomPackage", params()))]
 pub struct SbomPackage {
+    /// The SBOM internal ID of a package
     pub id: String,
+    /// The name of the package in the SBOM
     pub name: String,
+    /// An optional group/namespace for an SBOM package
+    pub group: Option<String>,
+    /// An optional version for an SBOM package
     pub version: Option<String>,
+    /// PURLs identifying the package
     #[graphql(skip)]
     pub purl: Vec<PurlSummary>,
+    /// CPEs identifying the package
     pub cpe: Vec<String>,
 }
 

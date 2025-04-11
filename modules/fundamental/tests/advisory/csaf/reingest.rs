@@ -78,6 +78,7 @@ async fn change_ps_num_advisories(ctx: &TrustifyContext) -> anyhow::Result<()> {
 /// Ingest the same document twice. First having an affected, then fixed state.
 #[test_context(TrustifyContext)]
 #[test(tokio::test)]
+
 async fn change_ps_list_vulns(ctx: &TrustifyContext) -> anyhow::Result<()> {
     let (r1, r2) = prepare_ps_state_change(ctx).await?;
 
@@ -97,25 +98,36 @@ async fn change_ps_list_vulns(ctx: &TrustifyContext) -> anyhow::Result<()> {
         .items
         .iter()
         .find(|purl| {
-            purl.base.purl.name == "eap7-bouncycastle-util"
-                && purl.version.version == "1.76.0-4.redhat_00001.1.el9eap"
+            purl.head.purl.name == "eap7-bouncycastle-util"
+                && purl.head.purl.version.as_deref() == Some("1.76.0-4.redhat_00001.1.el9eap")
         })
         .expect("must find one");
 
+    #[allow(deprecated)]
+    {
+        assert_eq!(
+            purl.base.purl,
+            Purl {
+                ty: "rpm".to_string(),
+                namespace: Some("redhat".to_string()),
+                name: "eap7-bouncycastle-util".to_string(),
+                version: None,
+                qualifiers: Default::default(),
+            }
+        );
+    }
     assert_eq!(
-        purl.base.purl,
-        Purl {
-            ty: "rpm".to_string(),
-            namespace: Some("redhat".to_string()),
-            name: "eap7-bouncycastle-util".to_string(),
-            version: None,
-            qualifiers: Default::default(),
-        }
+        purl.head.purl.version.as_deref(),
+        Some("1.76.0-4.redhat_00001.1.el9eap")
     );
-    assert_eq!(purl.version.version, "1.76.0-4.redhat_00001.1.el9eap");
 
     assert_eq!(
-        purl.qualifiers.clone().into_iter().collect::<Vec<_>>(),
+        purl.head
+            .purl
+            .qualifiers
+            .clone()
+            .into_iter()
+            .collect::<Vec<_>>(),
         vec![("arch".to_string(), "noarch".to_string())]
     );
 
@@ -144,7 +156,8 @@ async fn change_ps_list_vulns(ctx: &TrustifyContext) -> anyhow::Result<()> {
                 identifier: "CVE-2023-33201".to_string(),
                 ..Default::default()
             },
-            average_severity: Severity::High,
+            average_severity: Severity::Medium,
+            average_score: 5.3f64,
             status: "fixed".to_string(),
             context: Some(StatusContext::Cpe(
                 "cpe:/a:redhat:jboss_enterprise_application_platform:7.4:*:el9:*".to_string()
@@ -179,25 +192,36 @@ async fn change_ps_list_vulns_all(ctx: &TrustifyContext) -> anyhow::Result<()> {
         .items
         .iter()
         .find(|purl| {
-            purl.base.purl.name == "eap7-bouncycastle-util"
-                && purl.version.version == "1.76.0-4.redhat_00001.1.el9eap"
+            purl.head.purl.name == "eap7-bouncycastle-util"
+                && purl.head.purl.version.as_deref() == Some("1.76.0-4.redhat_00001.1.el9eap")
         })
         .expect("must find one");
 
+    #[allow(deprecated)]
+    {
+        assert_eq!(
+            purl.base.purl,
+            Purl {
+                ty: "rpm".to_string(),
+                namespace: Some("redhat".to_string()),
+                name: "eap7-bouncycastle-util".to_string(),
+                version: None,
+                qualifiers: Default::default(),
+            }
+        );
+    }
     assert_eq!(
-        purl.base.purl,
-        Purl {
-            ty: "rpm".to_string(),
-            namespace: Some("redhat".to_string()),
-            name: "eap7-bouncycastle-util".to_string(),
-            version: None,
-            qualifiers: Default::default(),
-        }
+        purl.head.purl.version.as_deref(),
+        Some("1.76.0-4.redhat_00001.1.el9eap")
     );
-    assert_eq!(purl.version.version, "1.76.0-4.redhat_00001.1.el9eap");
 
     assert_eq!(
-        purl.qualifiers.clone().into_iter().collect::<Vec<_>>(),
+        purl.head
+            .purl
+            .qualifiers
+            .clone()
+            .into_iter()
+            .collect::<Vec<_>>(),
         vec![("arch".to_string(), "noarch".to_string())]
     );
 
@@ -235,7 +259,8 @@ async fn change_ps_list_vulns_all(ctx: &TrustifyContext) -> anyhow::Result<()> {
                 identifier: "CVE-2023-33201".to_string(),
                 ..Default::default()
             },
-            average_severity: Severity::High,
+            average_severity: Severity::Medium,
+            average_score: 5.3f64,
             status: "affected".to_string(),
             context: Some(StatusContext::Cpe(
                 "cpe:/a:redhat:jboss_enterprise_application_platform:7.4:*:el9:*".to_string()
@@ -250,7 +275,8 @@ async fn change_ps_list_vulns_all(ctx: &TrustifyContext) -> anyhow::Result<()> {
                 identifier: "CVE-2023-33201".to_string(),
                 ..Default::default()
             },
-            average_severity: Severity::High,
+            average_severity: Severity::Medium,
+            average_score: 5.3f64,
             status: "fixed".to_string(),
             context: Some(StatusContext::Cpe(
                 "cpe:/a:redhat:jboss_enterprise_application_platform:7.4:*:el9:*".to_string()

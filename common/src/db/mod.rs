@@ -10,13 +10,19 @@ pub use func::*;
 
 use anyhow::{Context, ensure};
 use migration::{Migrator, MigratorTrait};
+use reqwest::Url;
 use sea_orm::{
-    ConnectOptions, ConnectionTrait, DatabaseConnection, DbBackend, DbErr, ExecResult, QueryResult,
-    RuntimeErr, Statement, prelude::async_trait,
+    AccessMode, ConnectOptions, ConnectionTrait, DatabaseConnection, DatabaseTransaction,
+    DbBackend, DbErr, ExecResult, IsolationLevel, QueryResult, RuntimeErr, Statement, StreamTrait,
+    TransactionError, TransactionTrait, prelude::async_trait,
 };
 use sqlx::error::ErrorKind;
-use std::ops::{Deref, DerefMut};
-use std::time::Duration;
+use std::{
+    error::Error,
+    ops::{Deref, DerefMut},
+    pin::Pin,
+    time::Duration,
+};
 use tracing::instrument;
 
 #[derive(Clone, Debug)]
@@ -31,7 +37,10 @@ impl Database {
     #[instrument(err)]
     pub async fn new(database: &crate::config::Database) -> Result<Self, anyhow::Error> {
         let url = database.to_url();
-        log::debug!("connect to {}", url);
+
+        if log::log_enabled!(log::Level::Debug) {
+            log::debug!("connect to {}", strip_password(url.clone()));
+        }
 
         let mut opt = ConnectOptions::new(url);
         opt.max_connections(database.max_conn);
@@ -176,6 +185,54 @@ impl ConnectionTrait for Database {
     }
 }
 
+#[async_trait::async_trait]
+impl TransactionTrait for Database {
+    async fn begin(&self) -> Result<DatabaseTransaction, DbErr> {
+        self.db.begin().await
+    }
+
+    async fn begin_with_config(
+        &self,
+        isolation_level: Option<IsolationLevel>,
+        access_mode: Option<AccessMode>,
+    ) -> Result<DatabaseTransaction, DbErr> {
+        self.db
+            .begin_with_config(isolation_level, access_mode)
+            .await
+    }
+
+    async fn transaction<F, T, E>(&self, callback: F) -> Result<T, TransactionError<E>>
+    where
+        F: for<'c> FnOnce(
+                &'c DatabaseTransaction,
+            ) -> Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'c>>
+            + Send,
+        T: Send,
+        E: Error + Send,
+    {
+        self.db.transaction(callback).await
+    }
+
+    async fn transaction_with_config<F, T, E>(
+        &self,
+        callback: F,
+        isolation_level: Option<IsolationLevel>,
+        access_mode: Option<AccessMode>,
+    ) -> Result<T, TransactionError<E>>
+    where
+        F: for<'c> FnOnce(
+                &'c DatabaseTransaction,
+            ) -> Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'c>>
+            + Send,
+        T: Send,
+        E: Error + Send,
+    {
+        self.db
+            .transaction_with_config(callback, isolation_level, access_mode)
+            .await
+    }
+}
+
 /// Implementation of the connection trait for our database struct.
 ///
 /// **NOTE**: We lack the implementations for the `mock` feature. However, the mock feature would
@@ -207,6 +264,33 @@ impl ConnectionTrait for &Database {
     }
 }
 
+#[async_trait::async_trait]
+impl StreamTrait for Database {
+    type Stream<'a> = <DatabaseConnection as StreamTrait>::Stream<'a>;
+
+    fn stream<'a>(
+        &'a self,
+        stmt: Statement,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Stream<'a>, DbErr>> + 'a + Send>> {
+        self.db.stream(stmt)
+    }
+}
+
+#[async_trait::async_trait]
+impl<'b> StreamTrait for &'b Database {
+    type Stream<'a>
+        = <DatabaseConnection as StreamTrait>::Stream<'a>
+    where
+        'b: 'a;
+
+    fn stream<'a>(
+        &'a self,
+        stmt: Statement,
+    ) -> Pin<Box<dyn Future<Output = Result<Self::Stream<'a>, DbErr>> + 'a + Send>> {
+        self.db.stream(stmt)
+    }
+}
+
 /// A trait to help working with database errors
 pub trait DatabaseErrors {
     /// return `true` if the error is a duplicate key error
@@ -221,5 +305,53 @@ impl DatabaseErrors for DbErr {
             }
             _ => false,
         }
+    }
+}
+
+/// Remove the password from the URL and replace it with `***`, if present.
+///
+/// If this is not a URL, or does not contain a password, this is a no-op.
+fn strip_password(url: String) -> String {
+    match Url::parse(&url) {
+        Ok(mut url) => {
+            if url.password().is_some() {
+                let _ = url.set_password(Some("***"));
+            }
+            url.to_string()
+        }
+        Err(_) => url,
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// ensure that the password is not present, but not necessarily removing the string itself
+    #[test]
+    fn url_strip_password() {
+        assert_eq!(
+            "postgres://trustify:***@infrastructure-postgresql:5432/trustify?sslmode=allow&other=trustify1234",
+            strip_password(
+                "postgres://trustify:trustify1234@infrastructure-postgresql:5432/trustify?sslmode=allow&other=trustify1234".to_string()
+            )
+        )
+    }
+
+    /// if there's no password, this shouldn't change anything
+    #[test]
+    fn url_strip_no_password() {
+        assert_eq!(
+            "postgres://trustify@infrastructure-postgresql:5432/trustify?sslmode=allow&other=trustify1234",
+            strip_password(
+                "postgres://trustify@infrastructure-postgresql:5432/trustify?sslmode=allow&other=trustify1234".to_string()
+            )
+        )
+    }
+
+    /// if this is not a URL, then it should not panic
+    #[test]
+    fn url_strip_password_not_a_url() {
+        assert_eq!("foo-bar-baz", strip_password("foo-bar-baz".to_string()))
     }
 }

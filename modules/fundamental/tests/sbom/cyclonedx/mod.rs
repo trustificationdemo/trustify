@@ -1,6 +1,7 @@
 mod corner_cases;
 mod cpe;
 mod external;
+mod parallel;
 mod purl;
 mod reingest;
 
@@ -18,7 +19,7 @@ async fn test_parse_cyclonedx(ctx: &TrustifyContext) -> Result<(), anyhow::Error
     test_with_cyclonedx(
         ctx,
         "zookeeper-3.9.2-cyclonedx.json",
-        |WithContext { service, sbom, .. }| async move {
+        async move |WithContext { service, sbom, .. }| {
             let described = service
                 .describes_packages(sbom.sbom.sbom_id, Default::default(), &ctx.db)
                 .await?;
@@ -83,7 +84,7 @@ async fn test_parse_cyclonedx(ctx: &TrustifyContext) -> Result<(), anyhow::Error
             Ok(())
         },
     )
-    .await
+        .await
 }
 
 #[test_context(TrustifyContext)]
@@ -92,7 +93,7 @@ async fn parse_cyclonedx_1dot6(ctx: &TrustifyContext) -> Result<(), anyhow::Erro
     test_with_cyclonedx(
         ctx,
         "cyclonedx/simple_1dot6.json",
-        |WithContext { service, sbom, .. }| async move {
+        async move |WithContext { service, sbom, .. }| {
             let described = service
                 .describes_packages(sbom.sbom.sbom_id, Default::default(), &ctx.db)
                 .await?;
@@ -123,6 +124,9 @@ async fn parse_cyclonedx_1dot6(ctx: &TrustifyContext) -> Result<(), anyhow::Erro
 
             assert_eq!(9, packages.total);
 
+            assert_eq!(sbom.sbom.authors, vec!["Some Author".to_string()]);
+            assert_eq!(sbom.sbom.suppliers, vec!["Some Supplier".to_string()]);
+
             Ok(())
         },
     )
@@ -130,14 +134,9 @@ async fn parse_cyclonedx_1dot6(ctx: &TrustifyContext) -> Result<(), anyhow::Erro
 }
 
 #[instrument(skip(ctx, f))]
-pub async fn test_with_cyclonedx<F, Fut>(
-    ctx: &TrustifyContext,
-    sbom: &str,
-    f: F,
-) -> anyhow::Result<()>
+pub async fn test_with_cyclonedx<F>(ctx: &TrustifyContext, sbom: &str, f: F) -> anyhow::Result<()>
 where
-    F: FnOnce(WithContext) -> Fut,
-    Fut: Future<Output = anyhow::Result<()>>,
+    F: AsyncFnOnce(WithContext) -> anyhow::Result<()>,
 {
     test_with(
         ctx,
@@ -147,8 +146,10 @@ where
                 serde_cyclonedx::cyclonedx::v_1_6::CycloneDx,
             >(data)?)
         },
-        |ctx, sbom, tx| {
-            Box::pin(async move { ctx.ingest_cyclonedx(sbom.clone(), &Discard, tx).await })
+        async move |ctx, sbom, tx| {
+            Ok(ctx
+                .ingest_cyclonedx(Box::new(sbom.clone()), &Discard, tx)
+                .await?)
         },
         |sbom| sbom::cyclonedx::Information(sbom).into(),
         f,

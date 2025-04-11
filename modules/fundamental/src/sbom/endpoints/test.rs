@@ -4,14 +4,49 @@ use crate::{
 };
 use actix_http::StatusCode;
 use actix_web::test::TestRequest;
+use flate2::bufread::GzDecoder;
 use serde_json::{Value, json};
+use std::io::Read;
 use test_context::test_context;
 use test_log::test;
 use trustify_common::{id::Id, model::PaginatedResults};
 use trustify_entity::labels::Labels;
 use trustify_module_ingestor::model::IngestResult;
 use trustify_test_context::{TrustifyContext, call::CallService, document_bytes};
+use urlencoding::encode;
 use uuid::Uuid;
+
+#[test_context(TrustifyContext)]
+#[test(actix_web::test)]
+async fn license_export(ctx: &TrustifyContext) -> Result<(), anyhow::Error> {
+    let app = caller(ctx).await?;
+    let id = ctx
+        .ingest_document("cyclonedx/application.cdx.json")
+        .await?
+        .id
+        .to_string();
+
+    let uri = format!("/api/v2/sbom/{id}/license-export");
+    let req = TestRequest::get().uri(&uri).to_request();
+    let response = app.call_service(req).await;
+
+    assert!(response.status().is_success());
+    let content_type = response
+        .headers()
+        .get("Content-Type")
+        .expect("Content-Type header missing");
+    assert_eq!(content_type, "application/gzip");
+
+    let body = actix_web::test::read_body(response).await;
+    let mut decoder = GzDecoder::new(&body[..]);
+    let mut decompressed = String::new();
+    decoder.read_to_string(&mut decompressed)?;
+
+    assert!(decompressed.contains("spring-petclinic_license_ref.csv"));
+    assert!(decompressed.contains("spring-petclinic_sbom_licenses.csv"));
+
+    Ok(())
+}
 
 #[test_context(TrustifyContext)]
 #[test(actix_web::test)]
@@ -228,7 +263,7 @@ async fn get_advisories(ctx: &TrustifyContext) -> Result<(), anyhow::Error> {
 
     // assert expected fields
     assert_eq!(v[0]["identifier"], "https://www.redhat.com/#CVE-2023-0044");
-    assert_eq!(v[0]["status"][0]["average_severity"], "high");
+    assert_eq!(v[0]["status"][0]["average_severity"], "medium");
 
     Ok(())
 }
@@ -267,6 +302,42 @@ async fn query_sboms_by_ingested_time(ctx: &TrustifyContext) -> Result<(), anyho
     assert_eq!(ubi["items"][0]["name"], json!("ubi9-container"));
     assert_eq!(zoo["total"], 1);
     assert_eq!(zoo["items"][0]["name"], json!("zookeeper"));
+
+    Ok(())
+}
+
+#[test_context(TrustifyContext)]
+#[test(actix_web::test)]
+async fn query_sboms_by_package(ctx: &TrustifyContext) -> Result<(), anyhow::Error> {
+    let query = async |purl, sort| {
+        let app = caller(ctx).await.unwrap();
+        let uri = format!(
+            "/api/v2/sbom/by-package?purl={}&sort={}",
+            encode(purl),
+            encode(sort)
+        );
+        let request = TestRequest::get().uri(&uri).to_request();
+        let response: Value = app.call_and_read_body_json(request).await;
+        tracing::debug!(test = "", "{response:#?}");
+        response
+    };
+
+    // Ingest 2 SBOM's that depend on the same purl
+    ctx.ingest_documents(["spdx/simple-ext-a.json", "spdx/simple-ext-b.json"])
+        .await?;
+
+    assert_eq!(
+        2,
+        query("pkg:rpm/redhat/A@0.0.0?arch=src", "").await["total"]
+    );
+    assert_eq!(
+        "simple-a",
+        query("pkg:rpm/redhat/A@0.0.0?arch=src", "name:asc").await["items"][0]["name"]
+    );
+    assert_eq!(
+        "simple-b",
+        query("pkg:rpm/redhat/A@0.0.0?arch=src", "name:desc").await["items"][0]["name"]
+    );
 
     Ok(())
 }

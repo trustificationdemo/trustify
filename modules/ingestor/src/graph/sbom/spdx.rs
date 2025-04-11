@@ -4,7 +4,8 @@ use crate::{
         product::ProductInformation,
         purl::creator::PurlCreator,
         sbom::{
-            FileCreator, LicenseCreator, LicenseInfo, PackageCreator, PackageReference, References,
+            FileCreator, LicenseCreator, LicenseInfo, LicensingInfo, LicensingInfoCreator,
+            NodeInfoParam, PackageCreator, PackageLicensenInfo, PackageReference, References,
             RelationshipCreator, SbomContext, SbomInformation, Spdx,
             processor::{
                 InitContext, PostContext, Processor, RedHatProductComponentRelationships,
@@ -17,13 +18,59 @@ use crate::{
 use sbom_walker::report::{ReportSink, check};
 use sea_orm::ConnectionTrait;
 use spdx_rs::models::{RelationshipType, SPDX};
+use std::collections::HashSet;
 use std::str::FromStr;
 use time::OffsetDateTime;
 use tracing::instrument;
 use trustify_common::{cpe::Cpe, purl::Purl};
-use trustify_entity::relationship::Relationship;
+use trustify_entity::{relationship::Relationship, sbom_package_license::LicenseCategory};
 
 pub struct Information<'a>(pub &'a SPDX);
+
+/// get the describing packages
+fn describing_packages(sbom: &SPDX) -> HashSet<&str> {
+    let mut packages = HashSet::<&str>::new();
+
+    for rel in &sbom.relationships {
+        match rel.relationship_type {
+            RelationshipType::Describes => {
+                packages.insert(&rel.spdx_element_id);
+            }
+            RelationshipType::DescribedBy => {
+                packages.insert(&rel.related_spdx_element);
+            }
+            _ => continue,
+        }
+    }
+
+    packages.extend(
+        sbom.document_creation_information
+            .document_describes
+            .iter()
+            .map(|s| s.as_str()),
+    );
+
+    packages
+}
+
+/// Extract suppliers for a SPDX SBOM by collecting suppliers of describing packages
+fn suppliers(sbom: &SPDX) -> Vec<String> {
+    // packages describing the SBOM
+    let describing = describing_packages(sbom);
+
+    // collect suppliers for matching packages
+    let mut result = HashSet::new();
+    for p in &sbom.package_information {
+        if !describing.contains(p.package_spdx_identifier.as_str()) {
+            continue;
+        }
+        if let Some(supplier) = &p.package_supplier {
+            result.insert(supplier.clone());
+        }
+    }
+
+    Vec::from_iter(result)
+}
 
 impl<'a> From<Information<'a>> for SbomInformation {
     fn from(value: Information<'a>) -> Self {
@@ -47,6 +94,7 @@ impl<'a> From<Information<'a>> for SbomInformation {
                 .creation_info
                 .creators
                 .clone(),
+            suppliers: suppliers(sbom),
             data_licenses: vec![value.0.document_creation_information.data_license.clone()],
         }
     }
@@ -137,6 +185,18 @@ impl SbomContext {
         }
 
         let mut licenses = LicenseCreator::new();
+        let mut license_extracted_refs = LicensingInfoCreator::new();
+
+        for license_ref in sbom_data.other_licensing_information_detected.clone() {
+            let extracted_licensing_info = &LicensingInfo::with_sbom_id(
+                self.sbom.sbom_id,
+                license_ref.license_name,
+                license_ref.license_identifier.clone(),
+                license_ref.extracted_text,
+                license_ref.license_comment,
+            );
+            license_extracted_refs.add(extracted_licensing_info);
+        }
 
         let mut packages =
             PackageCreator::with_capacity(self.sbom.sbom_id, sbom_data.package_information.len());
@@ -151,20 +211,17 @@ impl SbomContext {
             });
 
             let mut refs = Vec::new();
-            let mut license_refs = Vec::new();
-
+            // let mut license_refs = Vec::new();
+            let mut declared_license_ref = None;
+            let mut concluded_license_ref = None;
             if let Some(declared_license) = declared_license_info {
-                if declared_license.license != "NOASSERTION" {
-                    licenses.add(&declared_license);
-                    license_refs.push(declared_license);
-                }
+                let _ = declared_license_ref.insert(declared_license.clone());
+                licenses.add(&declared_license);
             }
 
             if let Some(concluded_license) = concluded_license_info {
-                if concluded_license.license != "NOASSERTION" {
-                    licenses.add(&concluded_license);
-                    license_refs.push(concluded_license);
-                }
+                let _ = concluded_license_ref.insert(concluded_license.clone());
+                licenses.add(&concluded_license);
             }
 
             let mut product_cpe = None;
@@ -220,12 +277,34 @@ impl SbomContext {
                 }
             }
 
+            let mut package_license_info = Vec::new();
+            package_license_info.append(
+                &mut declared_license_ref
+                    .iter()
+                    .map(|license| PackageLicensenInfo {
+                        license_id: license.uuid(),
+                        license_type: LicenseCategory::Declared,
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            package_license_info.append(
+                &mut concluded_license_ref
+                    .iter()
+                    .map(|license| PackageLicensenInfo {
+                        license_id: license.uuid(),
+                        license_type: LicenseCategory::Concluded,
+                    })
+                    .collect::<Vec<_>>(),
+            );
             packages.add(
-                package.package_spdx_identifier,
-                package.package_name,
-                package.package_version,
+                NodeInfoParam {
+                    node_id: package.package_spdx_identifier,
+                    name: package.package_name,
+                    group: None,
+                    version: package.package_version,
+                    package_license_info,
+                },
                 refs,
-                license_refs,
                 package.package_checksum,
             );
         }
@@ -256,6 +335,7 @@ impl SbomContext {
 
         // create all purls and CPEs
 
+        license_extracted_refs.create(db).await?;
         licenses.create(db).await?;
         purls.create(db).await?;
         cpes.create(db).await?;
@@ -270,7 +350,9 @@ impl SbomContext {
             .add_source(&doc_id)
             .add_source(&packages)
             .add_source(&files);
-        relationships.validate(sources).map_err(Error::Generic)?;
+        relationships
+            .validate(sources)
+            .map_err(Error::InvalidContent)?;
 
         // create packages, files, and relationships
 

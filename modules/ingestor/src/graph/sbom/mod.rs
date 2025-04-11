@@ -13,7 +13,7 @@ use super::error::Error;
 use crate::{
     db::{LeftPackageId, QualifiedPackageTransitive},
     graph::{
-        Graph, Outcome,
+        CreateOutcome, Graph, Outcome,
         cpe::CpeContext,
         product::{ProductContext, product_version::ProductVersionContext},
         purl::{creator::PurlCreator, qualified_package::QualifiedPackageContext},
@@ -21,23 +21,22 @@ use crate::{
 };
 use cpe::uri::OwnedUri;
 use entity::{product, product_version};
-use hex::ToHex;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, ModelTrait, QueryFilter,
-    QuerySelect, RelationTrait, Select, Set, prelude::Uuid,
+    QuerySelect, RelationTrait, Select, Set, TransactionTrait, prelude::Uuid,
 };
 use sea_query::{Condition, Expr, Func, JoinType, Query, SimpleExpr, extension::postgres::PgExpr};
 use std::{
     fmt::{Debug, Formatter},
-    iter,
     str::FromStr,
 };
 use time::OffsetDateTime;
 use tracing::instrument;
 use trustify_common::{cpe::Cpe, hashing::Digests, purl::Purl, sbom::SbomLocator};
 use trustify_entity::{
-    self as entity, labels::Labels, license, purl_license_assertion, relationship::Relationship,
-    sbom, sbom_node, sbom_package, sbom_package_cpe_ref, sbom_package_purl_ref, source_document,
+    self as entity, labels::Labels, license, relationship::Relationship, sbom, sbom_node,
+    sbom_package, sbom_package_cpe_ref, sbom_package_license, sbom_package_purl_ref,
+    source_document,
 };
 
 #[derive(Clone, Default)]
@@ -48,6 +47,7 @@ pub struct SbomInformation {
     pub name: String,
     pub published: Option<OffsetDateTime>,
     pub authors: Vec<String>,
+    pub suppliers: Vec<String>,
     /// The licenses of the data itself, if known.
     pub data_licenses: Vec<String>,
 }
@@ -92,40 +92,37 @@ impl Graph {
     }
 
     #[instrument(skip(connection, info), err(level=tracing::Level::INFO))]
-    pub async fn ingest_sbom<C: ConnectionTrait>(
+    pub async fn ingest_sbom<C>(
         &self,
         labels: impl Into<Labels> + Debug,
         digests: &Digests,
         document_id: Option<String>,
         info: impl Into<SbomInformation>,
         connection: &C,
-    ) -> Result<Outcome<SbomContext>, Error> {
-        let sha256 = digests.sha256.encode_hex::<String>();
-
-        if let Some(found) = self.get_sbom_by_digest(&sha256, connection).await? {
-            return Ok(Outcome::Existed(found));
-        }
-
+    ) -> Result<Outcome<SbomContext>, Error>
+    where
+        C: ConnectionTrait + TransactionTrait,
+    {
         let SbomInformation {
             node_id,
             name,
             published,
             authors,
+            suppliers,
             data_licenses,
         } = info.into();
 
-        let sbom_id = Uuid::now_v7();
-
-        let doc_model = source_document::ActiveModel {
-            id: Default::default(),
-            sha256: Set(sha256),
-            sha384: Set(digests.sha384.encode_hex()),
-            sha512: Set(digests.sha512.encode_hex()),
-            size: Set(digests.size as i64),
-            ingested: Set(OffsetDateTime::now_utc()),
+        let new_id = match self
+            .create_doc(digests, connection, async |sha256| {
+                self.get_sbom_by_digest(&sha256, connection).await
+            })
+            .await?
+        {
+            CreateOutcome::Exists(sbom) => return Ok(Outcome::Existed(sbom)),
+            CreateOutcome::Created(new_id) => new_id,
         };
 
-        let doc = doc_model.insert(connection).await?;
+        let sbom_id = Uuid::now_v7();
 
         let model = sbom::ActiveModel {
             sbom_id: Set(sbom_id),
@@ -135,8 +132,9 @@ impl Graph {
 
             published: Set(published),
             authors: Set(authors),
+            suppliers: Set(suppliers),
 
-            source_document_id: Set(Some(doc.id)),
+            source_document_id: Set(Some(new_id)),
             labels: Set(labels.into()),
             data_licenses: Set(data_licenses),
         };
@@ -419,15 +417,9 @@ impl SbomContext {
 
     pub async fn ingest_purl_license_assertion<C: ConnectionTrait>(
         &self,
-        purl: &Purl,
         license: &str,
         connection: &C,
     ) -> Result<(), Error> {
-        let purl = self
-            .graph
-            .ingest_qualified_package(purl, connection)
-            .await?;
-
         let license_info = LicenseInfo {
             license: license.to_string(),
         };
@@ -459,26 +451,14 @@ impl SbomContext {
             .await?
         };
 
-        let assertion = purl_license_assertion::Entity::find()
-            .filter(purl_license_assertion::Column::LicenseId.eq(license.id))
-            .filter(
-                purl_license_assertion::Column::VersionedPurlId
-                    .eq(purl.package_version.package_version.id),
-            )
-            .filter(purl_license_assertion::Column::SbomId.eq(self.sbom.sbom_id))
-            .one(connection)
-            .await?;
-
-        if assertion.is_none() {
-            purl_license_assertion::ActiveModel {
-                id: Default::default(),
-                license_id: Set(license.id),
-                versioned_purl_id: Set(purl.package_version.package_version.id),
-                sbom_id: Set(self.sbom.sbom_id),
-            }
-            .insert(connection)
-            .await?;
+        sbom_package_license::ActiveModel {
+            sbom_id: Set(self.sbom.sbom_id),
+            node_id: Set(self.sbom.node_id.clone()),
+            license_id: Set(license.id),
+            license_type: Set(sbom_package_license::LicenseCategory::Declared),
         }
+        .insert(connection)
+        .await?;
 
         Ok(())
     }
@@ -638,7 +618,17 @@ impl SbomContext {
                 qualified_purl,
             })
             .chain(cpes.into_iter().map(PackageReference::Cpe));
-        creator.add(node_id, name, version, refs, iter::empty(), Checksum::NONE);
+        creator.add(
+            NodeInfoParam {
+                node_id,
+                name,
+                group: None,
+                version,
+                package_license_info: vec![],
+            },
+            refs,
+            Checksum::NONE,
+        );
 
         creator.create(connection).await?;
 

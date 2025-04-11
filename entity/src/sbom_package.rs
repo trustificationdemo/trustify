@@ -7,6 +7,7 @@ pub struct Model {
     pub sbom_id: Uuid,
     #[sea_orm(primary_key)]
     pub node_id: String,
+    pub group: Option<String>,
     pub version: Option<String>,
 }
 
@@ -32,6 +33,19 @@ pub enum Relation {
         to = "(super::sbom_package_cpe_ref::Column::SbomId, super::sbom_package_cpe_ref::Column::NodeId)"
     )]
     Cpe,
+
+    #[sea_orm(
+        belongs_to = "super::sbom_package_license::Entity",
+        from = "(Column::SbomId, Column::NodeId)",
+        to = "(super::sbom_package_license::Column::SbomId, super::sbom_package_license::Column::NodeId)"
+    )]
+    PackageLicense,
+}
+
+impl Related<super::sbom_package_license::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::PackageLicense.def()
+    }
 }
 
 impl Related<super::sbom_node::Entity> for Entity {

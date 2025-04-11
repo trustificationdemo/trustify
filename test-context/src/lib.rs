@@ -3,6 +3,7 @@
 pub mod app;
 pub mod auth;
 pub mod call;
+pub mod flame;
 pub mod spdx;
 pub mod subset;
 
@@ -118,6 +119,22 @@ impl TrustifyContext {
     pub fn absolute_path(&self, path: impl AsRef<Path>) -> anyhow::Result<PathBuf> {
         absolute(path)
     }
+
+    pub async fn ingest_parallel<const N: usize>(
+        &self,
+        paths: [&str; N],
+    ) -> Result<[IngestResult; N], anyhow::Error> {
+        let mut f = vec![];
+
+        for path in paths {
+            f.push(self.ingest_document(path));
+        }
+
+        let r = futures::future::try_join_all(f).await?;
+        let r = r.try_into().expect("Unexpected number of results");
+
+        Ok(r)
+    }
 }
 
 impl AsyncTestContext for TrustifyContext {
@@ -128,7 +145,10 @@ impl AsyncTestContext for TrustifyContext {
             log::warn!("Using external database from 'DB_*' env vars");
             let config = common::config::Database::from_env().expect("DB config from env");
 
-            let db = if env::var("EXTERNAL_TEST_DB_BOOTSTRAP").is_ok() {
+            let db = if matches!(
+                env::var("EXTERNAL_TEST_DB_BOOTSTRAP").as_deref(),
+                Ok("1" | "true")
+            ) {
                 common::db::Database::bootstrap(&config).await
             } else {
                 common::db::Database::new(&config).await

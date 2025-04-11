@@ -22,9 +22,8 @@ use trustify_common::{
 use trustify_cvss::cvss3::{Cvss3Base, score::Score, severity::Severity};
 use trustify_entity::{
     advisory, base_purl, cpe, cvss3, license, organization, product, product_status,
-    product_version, product_version_range, purl_license_assertion, purl_status, qualified_purl,
-    sbom, sbom_package, sbom_package_purl_ref, status, version_range, versioned_purl,
-    vulnerability,
+    product_version, product_version_range, purl_status, qualified_purl, sbom, sbom_package,
+    sbom_package_purl_ref, status, version_range, versioned_purl, vulnerability,
 };
 use trustify_module_ingestor::common::{Deprecation, DeprecationForExt};
 use utoipa::ToSchema;
@@ -96,30 +95,12 @@ impl PurlDetails {
         )
         .await?;
 
-        let licenses = purl_license_assertion::Entity::find()
-            .join(
-                JoinType::LeftJoin,
-                purl_license_assertion::Relation::VersionedPurl.def(),
-            )
-            .join(
-                JoinType::LeftJoin,
-                purl_license_assertion::Relation::License.def(),
-            )
-            .join(
-                JoinType::LeftJoin,
-                purl_license_assertion::Relation::Sbom.def(),
-            )
-            .filter(versioned_purl::Column::Id.eq(package_version.id))
-            .try_into_multi_model::<LicenseCatcher>()?
-            .all(tx)
-            .await?;
-
         Ok(PurlDetails {
-            head: PurlHead::from_entity(&package, &package_version, qualified_package, tx).await?,
-            version: VersionedPurlHead::from_entity(&package, &package_version, tx).await?,
-            base: BasePurlHead::from_entity(&package).await?,
+            head: PurlHead::from_entity(&package, &package_version, qualified_package),
+            version: VersionedPurlHead::from_entity(&package, &package_version),
+            base: BasePurlHead::from_entity(&package),
             advisories: PurlAdvisory::from_entities(purl_statuses, product_statuses, tx).await?,
-            licenses: PurlLicenseSummary::from_entities(&licenses, tx).await?,
+            licenses: vec![], // Leave it empty for now and wait to add relevant content later.
         })
     }
 }
@@ -154,6 +135,10 @@ async fn get_product_statuses_for_purl<C: ConnectionTrait>(
         .join(JoinType::LeftJoin, product::Relation::ProductVersion.def())
         .join(JoinType::Join, product_status::Relation::Status.def())
         .join(JoinType::Join, product_status::Relation::Advisory.def())
+        .join(
+            JoinType::Join,
+            product_status::Relation::Vulnerability.def(),
+        )
         .filter(product_version::Column::SbomId.in_subquery(sbom_ids_query))
         .filter(Expr::col(product_status::Column::Package).eq(purl_name).or(
             namespace_name.map_or(Expr::value(false), |ns| {
@@ -182,7 +167,7 @@ async fn get_product_statuses_for_purl<C: ConnectionTrait>(
     Ok(product_statuses)
 }
 
-#[derive(Serialize, Deserialize, Debug, ToSchema, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, ToSchema, PartialEq)]
 pub struct PurlAdvisory {
     #[serde(flatten)]
     pub head: AdvisoryHead,
@@ -239,17 +224,8 @@ impl PurlAdvisory {
         }
 
         for product_status in product_statuses {
-            let vuln = vulnerability::Model {
-                id: product_status.product_status.vulnerability_id.clone(),
-                title: None,
-                reserved: None,
-                published: None,
-                modified: None,
-                withdrawn: None,
-                cwes: None,
-            };
             let purl_status = PurlStatus::new(
-                &vuln,
+                &product_status.vulnerability,
                 product_status.status.slug,
                 Some(product_status.cpe.to_string()),
                 tx,
@@ -284,10 +260,11 @@ impl PurlAdvisory {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, ToSchema, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, ToSchema, PartialEq)]
 pub struct PurlStatus {
     pub vulnerability: VulnerabilityHead,
     pub average_severity: Severity,
+    pub average_score: f64,
     pub status: String,
     #[schema(required)]
     pub context: Option<StatusContext>,
@@ -308,7 +285,7 @@ impl PurlStatus {
         tx: &C,
     ) -> Result<Self, Error> {
         let cvss3 = vuln.find_related(cvss3::Entity).all(tx).await?;
-        let average_severity = Score::from_iter(cvss3.iter().map(Cvss3Base::from)).severity();
+        let average_score = Score::from_iter(cvss3.iter().map(Cvss3Base::from));
         Ok(Self {
             vulnerability: VulnerabilityHead::from_vulnerability_entity(
                 vuln,
@@ -316,7 +293,8 @@ impl PurlStatus {
                 tx,
             )
             .await?,
-            average_severity,
+            average_severity: average_score.severity(),
+            average_score: average_score.value(),
             status,
             context: cpe.map(StatusContext::Cpe),
         })
@@ -343,7 +321,7 @@ impl PurlStatus {
     }
 }
 
-#[derive(Serialize, Clone, Deserialize, Debug, ToSchema)]
+#[derive(Serialize, Clone, Deserialize, Debug, ToSchema, Default)]
 pub struct PurlLicenseSummary {
     pub sbom: SbomHead,
     pub licenses: Vec<String>,
@@ -404,7 +382,7 @@ impl FromQueryResultMultiModel for LicenseCatcher {
 #[derive(Debug)]
 pub struct ProductStatusCatcher {
     advisory: advisory::Model,
-    product_status: product_status::Model,
+    vulnerability: vulnerability::Model,
     cpe: trustify_entity::cpe::Model,
     status: status::Model,
 }
@@ -413,7 +391,7 @@ impl FromQueryResult for ProductStatusCatcher {
     fn from_query_result(res: &QueryResult, _pre: &str) -> Result<Self, DbErr> {
         Ok(Self {
             advisory: Self::from_query_result_multi_model(res, "", advisory::Entity)?,
-            product_status: Self::from_query_result_multi_model(res, "", product_status::Entity)?,
+            vulnerability: Self::from_query_result_multi_model(res, "", vulnerability::Entity)?,
             cpe: Self::from_query_result_multi_model(res, "", trustify_entity::cpe::Entity)?,
             status: Self::from_query_result_multi_model(res, "", status::Entity)?,
         })
@@ -424,7 +402,7 @@ impl FromQueryResultMultiModel for ProductStatusCatcher {
     fn try_into_multi_model<E: EntityTrait>(select: Select<E>) -> Result<Select<E>, DbErr> {
         select
             .try_model_columns(advisory::Entity)?
-            .try_model_columns(product_status::Entity)?
+            .try_model_columns(vulnerability::Entity)?
             .try_model_columns(trustify_entity::cpe::Entity)?
             .try_model_columns(status::Entity)
     }
